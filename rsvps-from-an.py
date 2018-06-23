@@ -6,27 +6,28 @@ Airtable.
 
 import requests
 import argparse
-from collections import Counter
 import pprint
 import maya
 import sys
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--an-title', help='Event title (public) in Action Network')
-parser.add_argument('--an-name', default='', help='Event name (admin) '
-        'in Action Network')
-parser.add_argument('--airtable-name', help='Event name in Airtable '
-        '(<name> <date>)')
+parser.add_argument('--an-name', required=True,
+                    help='Event name (admin) in Action Network')
+parser.add_argument('--airtable-name', required=True,
+                    help='Event name in Airtable (<name> <date>)')
+parser.add_argument('--an-api-key', help='API Key for Action Network')
+parser.add_argument('--at-api-key', help='API Key for Airtable')
 parser.add_argument('--attendees', action='store_true',
-        help='Action Network resource is sign-in form')
+                    help='Action Network resource is sign-in form')
 parser.add_argument('-f', '--force', help='Do not ask for confirmation')
 
 args = parser.parse_args()
 
-AN_Token = 'xxxx'
+AN_Token = args.an_api_key
 AN_Entrypoint = 'https://actionnetwork.org/api/v2/'
 
-Airtable_Token = 'xxxx'
+Airtable_Token = args.at_api_key
 Airtable_Entrypoint = 'https://api.airtable.com/v0/appKBM2llidtAm4kw/'
 
 event_title = args.an_title
@@ -37,62 +38,37 @@ AN_header = {'OSDI-API-Token': AN_Token}
 Airtable_header = {'Authorization': 'Bearer %s' % Airtable_Token}
 
 if args.attendees:
-    AN_response = requests.get(AN_Entrypoint + 'forms', headers=AN_header)
-    json_response = AN_response.json()
-
-    for form in json_response['_embedded']['osdi:forms']:
-        if form['title'] == event_title and form['name'] == event_name:
-            print('Found form!')
-            print('Title: %s' % form['title'])
-            print('Administrative name: %s' % form['name'])
-            print(maya.MayaDT.from_iso8601(form['created_date']).rfc2822())
-            proceed = input('Proceed with transfer? y/[n] ')
-            if proceed not in 'Yy':
-                print('Aborting...')
-                sys.exit(0)
-            for identifier in form['identifiers']:
-                if identifier[:14] == 'action_network':
-                    form_id = identifier[15:]
-            submissions_link = form['_links']['osdi:submissions']['href']
-
-    AN_response = requests.get(submissions_link, headers=AN_header)
-    json_response = AN_response.json()
-    rsvp_ids = []
-    while json_response['page'] <= json_response['total_pages']:
-        rsvp_ids.extend(x['action_network:person_id'] for x in
-                json_response['_embedded']['osdi:submissions'])
-        AN_response = requests.get(json_response['_links']['next']['href'],
-                headers=AN_header)
-        json_response = AN_response.json()
+    var1, var2 = 'forms', 'submissions'
 else:
-    AN_response = requests.get(AN_Entrypoint + 'events', headers=AN_header)
+    var1, var2 = 'events', 'attendances'
+
+AN_response = requests.get(AN_Entrypoint + var1, headers=AN_header)
+json_response = AN_response.json()
+
+for form in json_response['_embedded']['osdi:'+var1]:
+    if form['title'] == event_title and form['name'] == event_name:
+        print('Found form!')
+        print('Title: %s' % form['title'])
+        print('Administrative name: %s' % form['name'])
+        print(maya.MayaDT.from_iso8601(form['created_date']).rfc2822())
+        proceed = input('Proceed with transfer? y/[n] ')
+        if proceed not in 'Yy':
+            print('Aborting...')
+            sys.exit(0)
+        for identifier in form['identifiers']:
+            if identifier[:14] == 'action_network':
+                form_id = identifier[15:]
+        href = form['_links']['osdi:'+var2]['href']
+
+AN_response = requests.get(href, headers=AN_header)
+json_response = AN_response.json()
+rsvp_ids = []
+while json_response['page'] <= json_response['total_pages']:
+    rsvp_ids.extend(x['action_network:person_id'] for x in
+            json_response['_embedded']['osdi:'+var2])
+    AN_response = requests.get(json_response['_links']['next']['href'],
+            headers=AN_header)
     json_response = AN_response.json()
-
-    for event in json_response['_embedded']['osdi:events']:
-        if event['title'] == event_title and event['name'] == event_name:
-            print('Found event!')
-            print('Title: %s' % event['title'])
-            print('Administrative name: %s' % event['name'])
-            print(maya.MayaDT.from_iso8601(event['start_date']).rfc2822())
-            proceed = input('Proceed with transfer? y/[n] ')
-            if proceed not in 'Yy':
-                print('Aborting...')
-                sys.exit(0)
-            for identifier in event['identifiers']:
-                if identifier[:14] == 'action_network':
-                    event_id = identifier[15:]
-            attendances_link = event['_links']['osdi:attendances']['href']
-
-    AN_response = requests.get(attendances_link, headers=AN_header)
-    json_response = AN_response.json()
-    rsvp_ids = []
-    while json_response['page'] <= json_response['total_pages']:
-        rsvp_ids.extend(x['action_network:person_id'] for x in
-                json_response['_embedded']['osdi:attendances'])
-        AN_response = requests.get(json_response['_links']['next']['href'],
-                headers=AN_header)
-        json_response = AN_response.json()
-
 
 Airtable_params = {'fields[]': ['Name', 'AN unique ID'],
         'filterByFormula': 'FIND({AN unique ID}, "' +
