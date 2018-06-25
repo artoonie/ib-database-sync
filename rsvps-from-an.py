@@ -1,146 +1,229 @@
-'''
-Fetch the RSVPs from a given event in ActionNetwork and import them into
-Airtable.
-
-'''
-
+from contextlib import contextmanager
+import os
+import hashlib
 import requests
 import argparse
-import pprint
-import maya
-import sys
+import json
+import time
+import timeago
+
+class Member(object):
+    """ Equality Fields are a list of fields of Member for which two
+        objects will be considered if all of these fields are equal.
+        This is supported by sorting, hashing, and comparisons. """
+    equality_fields = []
+
+    def __init__(self, first_name, last_name, email_address, zip_code):
+        self.first_name = first_name
+        self.last_name = last_name
+        self.email_address = email_address
+        self.zip_code = zip_code
+        Member.equality_fields = self.__dict__.keys()
+
+    def __str__(self):
+        d = dict([(key, self.__dict__[key]) for key in Member.equality_fields])
+        return str(d)
+
+    def prettystring(self):
+        return "%s %s <%s> - %10s" % (self.first_name,
+                                      self.last_name,
+                                      self.email_address,
+                                      self.zip_code)
+
+    @classmethod
+    @contextmanager
+    def equality_fields_as(cls, fields):
+        """ Use this context-managed function to temporarily change what it
+            means for two Members to be equal. Useful for pivoting on
+            certain fields. """
+        orig_fields = cls.equality_fields
+        cls.equality_fields = fields
+        yield
+        cls.equality_fields = orig_fields
+
+    def __lt__(self, other):
+        sort_order = ['last_name', 'first_name', 'email_address', 'zip_code']
+        equality_fields_sorted = sorted(self.equality_fields,
+                                        key=lambda x: sort_order.index(x))
+        for field in equality_fields_sorted:
+            if self.isEq(other, field):
+                continue
+            else:
+                return self.__dict__[field] < other.__dict__[field]
+        return False
+
+    def isEq(self, other, field):
+        this = self.__dict__[field]
+        that = other.__dict__[field]
+        if this == that: return True
+        if this is None or that is None: return False
+        return this.lower() == that.lower()
+
+    def __eq__(self, other):
+        return all([self.isEq(other, field) for field in self.equality_fields])
+
+    def is_mergeable(self, other):
+        """ Update this function with any combination of fields which
+            suggest that two entries are equivalent and therefore
+            mergeable. """
+        required_equal_field_sets = [['last_name', 'first_name'],
+                                     ['email_address']]
+
+        # Check to see if any of the field sets are the same
+        for field_set in required_equal_field_sets:
+            isEqual = True
+            for field in field_set:
+                if not self.isEq(other, field):
+                    isEqual = False
+                    break
+            if isEqual:
+                break
+
+        return isEqual
+
+    def __hash__(self):
+        return int(hashlib.md5(str(self)).hexdigest(), 16)
+
+class ANMember(Member):
+    def __init__(self, json_from_an):
+        address = json_from_an['postal_addresses'][0]
+        super(ANMember, self).__init__(
+            email_address = json_from_an['email_addresses'][0]['address'],
+            first_name    = json_from_an.get('given_name'),
+            last_name     = json_from_an.get('family_name'),
+            zip_code      = address.get('postal_code'))
+        #self.last_edit     = json_from_an['modified_date']
+
+class ATMember(Member):
+    requestedFields = ['Email Address',
+                       'First Name',
+                       'Last Name',
+                       'Zip code']
+
+    def __init__(self, json_from_at):
+        super(ATMember, self).__init__(
+            email_address = json_from_at.get(self.requestedFields[0]),
+            first_name    = json_from_at.get(self.requestedFields[1]),
+            last_name     = json_from_at.get(self.requestedFields[2]),
+            zip_code      = json_from_at.get(self.requestedFields[3]))
+        #self.last_edit     = json_from_at.get('createdTime', None) # TODO: Is this modified or created?
+
+class Connection(object):
+    def make_request(self, cache_filename=None):
+        """ set cache_filename to enable caching of this result """
+        if cache_filename is None or not os.path.exists(cache_filename):
+            print("Requesting " + self.href)
+            response = requests.get(self.href,
+                                    params = self.params,
+                                    headers = self.header)
+            time.sleep(0.2) # Respect AirTable rate limiting rules
+            json_response = response.json()
+            if cache_filename:
+                with open(cache_filename, 'w') as cached_json_fp:
+                    json.dump(json_response, cached_json_fp,
+                              sort_keys=True, indent=4)
+        else:
+            timestamp = os.path.getctime(cache_filename)
+            ago = timeago.format(timestamp)
+            print("Loading %s from cache downloaded %s" % (cache_filename, ago))
+            with open(cache_filename, 'r') as cached_json_fp:
+                json_response = json.load(cached_json_fp)
+
+        return json_response
+
+class ANConnection(Connection):
+    def __init__(self, an_token):
+        self.header = {'OSDI-API-Token': an_token}
+        self.params = None
+        self.href = 'https://actionnetwork.org/api/v2/people'
+
+    def _create_members_from(self, an_json):
+        members_json = an_json['_embedded']['osdi:people']
+        return [ANMember(x) for x in members_json]
+
+    def create_members(self):
+        """ Note: destructive; destroys self.href """
+        members = []
+        page = 0
+        while True:
+            an_json = self.make_request('an_cache_%s.json' % page)
+            members.extend(self._create_members_from(an_json))
+
+            self.href = an_json
+            if 'next' not in an_json['_links']:
+                print("Loaded %d members from ActionNetwork" % len(members))
+                return members
+
+            self.href = an_json['_links']['next']['href']
+            page += 1
+            assert page < 500 # safety check
+
+class ATConnection(Connection):
+    def __init__(self, at_token):
+        self.header = {'Authorization': 'Bearer %s' % at_token}
+        self.params = {'fields': ATMember.requestedFields}
+        self.href = 'https://api.airtable.com/v0/appKBM2llidtAm4kw/'\
+                    'Community%20Members'
+
+    def _create_members_from(self, at_json):
+        members_json = at_json['records']
+        return [ATMember(x['fields']) for x in members_json]
+
+    def create_members(self):
+        """ Note: destructive; destroys self.params """
+        members = []
+        page = 0
+        while True:
+            at_json = self.make_request('at_cache_%s.json' % page)
+            members.extend(self._create_members_from(at_json))
+
+            if 'offset' not in at_json:
+                print("Loaded %d members from AirTable" % len(members))
+                return members
+
+            self.params['offset'] = at_json['offset']
+            page += 1
+            assert page < 500 # safety check
+
+def print_differences(an_set, at_set):
+    def get(members, i):
+        if i < len(members):
+            return members[i].prettystring()
+        else:
+            return ""
+
+    union = an_set.union(at_set)
+    not_in_an = union - an_set
+    not_in_at = union - at_set
+    not_in_an_sorted = sorted(not_in_an)
+    not_in_at_sorted = sorted(not_in_at)
+
+    print len(not_in_at), "entries in ActionNetwork not in AirTable"
+    print len(not_in_an), "entries in AirTable not in ActionNetwork"
+    print "%80s %80s" % ("Entries missing from ActionNetwork", "Entries missing from AirTable")
+    for i in xrange(max(len(not_in_an),len(not_in_at))):
+        print ("%80s %80s" % (get(not_in_an_sorted, i), get(not_in_at_sorted, i))).encode('utf-8')
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--an-title', help='Event title (public) in Action Network')
-parser.add_argument('--an-name', required=True,
-                    help='Event name (admin) in Action Network')
-parser.add_argument('--airtable-name', required=True,
-                    help='Event name in Airtable (<name> <date>)')
-parser.add_argument('--an-api-key', help='API Key for Action Network')
-parser.add_argument('--at-api-key', help='API Key for Airtable')
-parser.add_argument('--attendees', action='store_true',
-                    help='Action Network resource is sign-in form')
-parser.add_argument('-f', '--force', help='Do not ask for confirmation')
-
+parser.add_argument('--an-api-key',
+                    help = 'API Key for Action Network',
+                    required = True)
+parser.add_argument('--at-api-key',
+                    help = 'API Key for Airtable',
+                    required = True)
 args = parser.parse_args()
+an_token = args.an_api_key
+at_token = args.at_api_key
 
-AN_Token = args.an_api_key
-AN_Entrypoint = 'https://actionnetwork.org/api/v2/'
+an_connection = ANConnection(an_token)
+an_members = an_connection.create_members()
 
-Airtable_Token = args.at_api_key
-Airtable_Entrypoint = 'https://api.airtable.com/v0/appKBM2llidtAm4kw/'
+at_connection = ATConnection(at_token)
+at_members = at_connection.create_members()
 
-event_title = args.an_title
-event_name = args.an_name
-Airtable_event_name = args.airtable_name
+print "Found %d members on ActionNetwork and %d members on AirTable" % (len(an_members), len(at_members))
 
-AN_header = {'OSDI-API-Token': AN_Token}
-Airtable_header = {'Authorization': 'Bearer %s' % Airtable_Token}
-
-if args.attendees:
-    var1, var2 = 'forms', 'submissions'
-else:
-    var1, var2 = 'events', 'attendances'
-
-AN_response = requests.get(AN_Entrypoint + var1, headers=AN_header)
-json_response = AN_response.json()
-
-for form in json_response['_embedded']['osdi:'+var1]:
-    if form['title'] == event_title and form['name'] == event_name:
-        print('Found form!')
-        print('Title: %s' % form['title'])
-        print('Administrative name: %s' % form['name'])
-        print(maya.MayaDT.from_iso8601(form['created_date']).rfc2822())
-        proceed = input('Proceed with transfer? y/[n] ')
-        if proceed not in 'Yy':
-            print('Aborting...')
-            sys.exit(0)
-        for identifier in form['identifiers']:
-            if identifier[:14] == 'action_network':
-                form_id = identifier[15:]
-        href = form['_links']['osdi:'+var2]['href']
-
-AN_response = requests.get(href, headers=AN_header)
-json_response = AN_response.json()
-rsvp_ids = []
-while json_response['page'] <= json_response['total_pages']:
-    rsvp_ids.extend(x['action_network:person_id'] for x in
-            json_response['_embedded']['osdi:'+var2])
-    AN_response = requests.get(json_response['_links']['next']['href'],
-            headers=AN_header)
-    json_response = AN_response.json()
-
-Airtable_params = {'fields[]': ['Name', 'AN unique ID'],
-        'filterByFormula': 'FIND({AN unique ID}, "' +
-        ';'.join(rsvp_ids) + '")'}
-Airtable_response = requests.get(Airtable_Entrypoint +
-        'Community%20Members', params=Airtable_params,
-        headers=Airtable_header)
-json_response = Airtable_response.json()
-retrieved_ids = [record['fields']['AN unique ID'] for record in
-        json_response['records']]
-new_ids = []
-for rsvp_id in rsvp_ids:
-    if rsvp_id not in retrieved_ids:
-        new_ids.append(rsvp_id)
-
-for new_id in new_ids:
-    AN_response = requests.get(AN_Entrypoint + 'people/' + new_id,
-            headers=AN_header)
-    json_response = AN_response.json()
-    if json_response.get('postal_addresses', None) is not None:
-        full_address = json_response['postal_addresses'][0]
-        address = ', '.join(full_address.get('address_lines', []))
-        city = full_address.get('locality', '')
-        zipcode = full_address.get('postal_code', '')
-    else:
-        address = ''
-        city = ''
-        zipcode = ''
-
-    new_record = {'fields': {
-        'First Name': json_response.get('given_name', '').strip(),
-        'Last Name': json_response.get('family_name', '').strip(),
-        'Email Address': json_response['email_addresses'][0]['address'],
-        'AN unique ID': new_id,
-        'Address': address,
-        'City': city,
-        'Zip code': zipcode,
-        }
-        }
-    Airtable_header['Content-type'] = 'application/json'
-    Airtable_response = requests.post(Airtable_Entrypoint +
-            'Community%20Members', headers=Airtable_header,
-            json=new_record)
-    del Airtable_header['Content-type']
-
-# Fetch the event from Airtable
-Airtable_params = {'fields[]': ['Event'],
-        'filterByFormula': '{Event} = "%s"' % Airtable_event_name}
-Airtable_response = requests.get(Airtable_Entrypoint + 'Events',
-        params=Airtable_params, headers=Airtable_header)
-json_response = Airtable_response.json()
-pprint.pprint(json_response)
-record_id = json_response['records'][0]['id']
-Airtable_params = {'fields[]': ['Name'],
-        'filterByFormula': 'FIND({AN unique ID}, "' +
-        ';'.join(rsvp_ids) + '")'}
-Airtable_response = requests.get(Airtable_Entrypoint +
-        'Community%20Members', params=Airtable_params,
-        headers=Airtable_header)
-json_response = Airtable_response.json()
-if args.attendees:
-    table_name = 'Event%20Attendance'
-else:
-    table_name = 'Event%20RSVPs'
-for record in json_response['records']:
-    # Add new entry for event RSVPs
-    new_record = {'fields': {
-        'Name link': [record['id']],
-        'Event': [record_id],
-        }
-        }
-    Airtable_header['Content-type'] = 'application/json'
-    Airtable_response = requests.post(Airtable_Entrypoint +
-            table_name, json=new_record, headers=Airtable_header)
-    del Airtable_header['Content-type']
+with Member.equality_fields_as(['zip_code']):
+    an_set = set(an_members)
+    at_set = set(at_members)
+    print_differences(an_set, at_set)
