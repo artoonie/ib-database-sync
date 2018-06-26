@@ -9,7 +9,7 @@ import timeago
 
 """ This class is sortable and hashable. Add additional fields as desired. """
 class Member(object):
-    def __init__(self, first_name, last_name, email_address, zip_code):
+    def __init__(self, first_name, last_name, email_address, zip_code, last_edit, source_name):
         self.first_name = first_name
         self.last_name = last_name
         self.email_address = email_address
@@ -20,6 +20,11 @@ class Member(object):
         # This is supported by sorting, hashing, and comparisons.
         self.equality_fields = self.__dict__.keys()
 
+        # Everything below this line will not be a part of the equality fields
+        self.last_edit = last_edit
+        self.source_name = source_name
+        self.dirty = False
+
     def hash_with(self, only_these_fields = None):
         """ Gets a unique hash using only_these_fields. If left as the default
             None, uses all available fields. """
@@ -27,6 +32,17 @@ class Member(object):
             only_these_fields = self.equality_fields
         d = dict([(key, self.__dict__[key]) for key in only_these_fields])
         return str(d)
+
+    def get(self, field):
+        assert field in self.equality_fields
+        return self.__dict__[field]
+
+    def set(self, field, value):
+        assert field in self.equality_fields
+
+        if self.__dict__[field] != value:
+            self.dirty = True
+            self.__dict__[field] = value
 
     def prettystring(self):
         return "%30s %60s - %10s" % \
@@ -102,9 +118,11 @@ class ANConnection(Connection):
         address = member_json['postal_addresses'][0]
         return Member(
             email_address = member_json['email_addresses'][0]['address'],
+            last_edit     = member_json['modified_date'],
             first_name    = member_json.get('given_name'),
             last_name     = member_json.get('family_name'),
-            zip_code      = address.get('postal_code'))
+            zip_code      = address.get('postal_code'),
+            source_name   = "ActionNetwork")
 
     def _create_members_from(self, an_json):
         members_json = an_json['_embedded']['osdi:people']
@@ -140,14 +158,17 @@ class ATConnection(Connection):
                     'Community%20Members'
 
     def _create_member_from(self, member_json):
+        # TODO: Can we get the modified time instead of created?
+        last_edit = member_json.get('createdTime', None)
+
         return Member(
             email_address = member_json.get(self.fields_to_request[0]),
             first_name    = member_json.get(self.fields_to_request[1]),
             last_name     = member_json.get(self.fields_to_request[2]),
-            zip_code      = member_json.get(self.fields_to_request[3]))
+            zip_code      = member_json.get(self.fields_to_request[3]),
+            last_edit     = last_edit,
+            source_name   = "AirTable")
 
-        # TODO: Can we get the modified time instead of created?
-        # last_edit = json_from_at.get('createdTime', None)
 
     def _create_members_from(self, at_json):
         members_json = at_json['records']
@@ -168,6 +189,35 @@ class ATConnection(Connection):
             self.params['offset'] = at_json['offset']
             page += 1
             assert page < 500 # safety check
+
+class MergeConflict(object):
+    def __init__(self, members):
+        self.members = members
+
+    def phase0_resolve_empties(self):
+        all_conflicts_resolved = True
+        for field in self.members[0].equality_fields:
+            values = [m.get(field) for m in self.members]
+            if all([v == values[0] for v in values]):
+                # No conflict
+                continue
+
+            is_none  = [v for v in values if v is None]
+            not_none = [v for v in values if v is not None]
+            if len(not_none) > 1:
+                # Conflicting values - cannot resolve simply
+                all_conflicts_resolved = False
+                continue
+
+            assert len(not_none) == 1
+            real_value = not_none[0]
+
+            for member in self.members:
+                member.set(field, real_value)
+        return all_conflicts_resolved
+
+    def resolve(self):
+        return self.phase0_resolve_empties()
 
 def hash_members(members, field_set):
     d = {}
@@ -209,8 +259,10 @@ def find_duplicates_across(all_members, field_set,
 
         if not is_in_at_all or not is_in_an_all:
             if is_in_at_some and is_in_an_some:
-                merge_conflicts.append((an_dict_some_fields[key_in_some],
-                                        at_dict_some_fields[key_in_some]))
+                members_conflicted = an_dict_some_fields[key_in_some] +\
+                                     at_dict_some_fields[key_in_some]
+                conflict = MergeConflict(members_conflicted)
+                merge_conflicts.append(conflict)
             elif is_in_at_some and not is_in_an_some:
                 needs_sync.append(member)
             elif is_in_an_some and not is_in_at_some:
@@ -222,12 +274,18 @@ def find_duplicates_across(all_members, field_set,
     return merge_conflicts, needs_sync, up_to_date
 
 def print_merge_conflicts(merge_conflicts):
-    for an_members, at_members in merge_conflicts:
-        for members,name in ((an_members,"ActionNetwork"),
-                             (at_members,"AirTable")):
-            for member in members:
-                print "%30s has:" % name, member.prettystring()
+    for conflict in merge_conflicts:
+        for member in conflict.members:
+            name = member.source_name
+            print "%30s has:" % name, member.prettystring()
         print
+
+def resolve_merge_conflicts(merge_conflicts):
+    unresolved = []
+    for merge_conflict in merge_conflicts:
+        if not merge_conflict.resolve():
+            unresolved.append(merge_conflict)
+    return unresolved
 
 def print_needs_sync(needs_sync, field_set,
                      at_dict_some_fields, an_dict_some_fields):
@@ -258,6 +316,8 @@ def get_merge_info(an_members, at_members, equivalence_fields, verbose):
                                 an_dict_all_fields, at_dict_all_fields,
                                 an_dict_some_fields, at_dict_some_fields)
 
+    unresolved_conflicts = resolve_merge_conflicts(merge_conflicts)
+
     if verbose:
         print "#"*100
         print "#"*100
@@ -275,7 +335,8 @@ def get_merge_info(an_members, at_members, equivalence_fields, verbose):
         print_duplicates_within(at_dups)
     if verbose:
         print "#"*100
-    print "There are %d members with merge conflicts" % len(merge_conflicts)
+    print "There are %d merge conflicts" % len(merge_conflicts)
+    print " of which %d require manual resolution." % len(unresolved_conflicts)
     print "There are %d members that can be cleanly synced" % len(needs_sync)
     print "There are %d members that are fully synced" % len(up_to_date)
     if verbose:
