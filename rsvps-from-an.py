@@ -24,11 +24,19 @@ class Member(object):
         d = dict([(key, self.__dict__[key]) for key in Member.equality_fields])
         return str(d)
 
+    def hash_with(self, only_these_fields = None):
+        """ Gets a unique hash using only_these_fields. If left as the default
+            None, uses all available fields. """
+        if only_these_fields is None:
+            only_these_fields = Member.equality_fields
+        d = dict([(key, self.__dict__[key]) for key in only_these_fields])
+        return str(d)
+
     def prettystring(self):
-        return "%s %s <%s> - %10s" % (self.first_name,
-                                      self.last_name,
-                                      self.email_address,
-                                      self.zip_code)
+        return "%30s %60s - %10s" % \
+                (unicode(self.first_name) + " " + unicode(self.last_name),
+                 "<"+unicode(self.email_address)+">",
+                 self.zip_code)
 
     @classmethod
     @contextmanager
@@ -204,26 +212,133 @@ def print_differences(an_set, at_set):
     for i in xrange(max(len(not_in_an),len(not_in_at))):
         print ("%80s %80s" % (get(not_in_an_sorted, i), get(not_in_at_sorted, i))).encode('utf-8')
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--an-api-key',
-                    help = 'API Key for Action Network',
-                    required = True)
-parser.add_argument('--at-api-key',
-                    help = 'API Key for Airtable',
-                    required = True)
-args = parser.parse_args()
-an_token = args.an_api_key
-at_token = args.at_api_key
+def hash_members(members, field_set):
+    d = {}
+    for m in members:
+        key = m.hash_with(field_set)
+        if key not in d:
+            d[key] = []
+        if key in d:
+            d[key].append(m)
+    return d
 
-an_connection = ANConnection(an_token)
-an_members = an_connection.create_members()
+def find_duplicates_within(hashed_members):
+    hm = hashed_members
+    return [hm[key] for key in hm if len(hm[key]) > 1]
 
-at_connection = ATConnection(at_token)
-at_members = at_connection.create_members()
+def print_duplicates_within(dups):
+    for dup_list in dups:
+        for member in dup_list:
+            print member.prettystring()
+        print
 
-print "Found %d members on ActionNetwork and %d members on AirTable" % (len(an_members), len(at_members))
+def find_duplicates_across(all_members, field_set,
+                           an_dict_all_fields,  at_dict_all_fields,
+                           an_dict_some_fields, at_dict_some_fields):
+    merge_conflicts = []
+    needs_sync = []
+    up_to_date = []
 
-with Member.equality_fields_as(['zip_code']):
-    an_set = set(an_members)
-    at_set = set(at_members)
-    print_differences(an_set, at_set)
+    for member in all_members:
+        key_in_all = member.hash_with(None)
+        key_in_some = member.hash_with(field_set)
+
+        is_in_at_all = key_in_all in at_dict_all_fields
+        is_in_an_all = key_in_all in an_dict_all_fields
+        is_in_at_some = key_in_some in at_dict_some_fields
+        is_in_an_some = key_in_some in an_dict_some_fields
+        assert is_in_at_all or is_in_an_all
+        assert is_in_at_some or is_in_an_some
+
+        if not is_in_at_all or not is_in_an_all:
+            if is_in_at_some and is_in_an_some:
+                merge_conflicts.append((an_dict_some_fields[key_in_some],
+                                        at_dict_some_fields[key_in_some]))
+            elif is_in_at_some and not is_in_an_some:
+                needs_sync.append(member)
+            elif is_in_an_some and not is_in_at_some:
+                needs_sync.append(member)
+            else:
+                assert False
+        else:
+            up_to_date.append(member)
+    return merge_conflicts, needs_sync, up_to_date
+
+def print_merge_conflicts(merge_conflicts):
+    for an_members, at_members in merge_conflicts:
+        for members,name in ((an_members,"ActionNetwork"),
+                             (at_members,"AirTable")):
+            for member in members:
+                print "%30s has:" % name, member.prettystring()
+        print
+
+def print_needs_sync(needs_sync, field_set, at_dict_some_fields, an_dict_some_fields):
+    for member in needs_sync:
+        key = member.hash_with(field_set)
+        if key not in at_dict_some_fields:
+            print "     Airtable is missing member", member.prettystring()
+        elif key not in an_dict_some_fields:
+            print "ActionNetwork is missing member", member.prettystring()
+        else:
+            assert False
+
+def get_merge_info(an_members, at_members, equivalence_fields):
+    an_dict_all_fields  = hash_members(an_members, None)
+    at_dict_all_fields  = hash_members(at_members, None)
+    an_dict_some_fields = hash_members(an_members, field_set)
+    at_dict_some_fields = hash_members(at_members, field_set)
+
+    an_dups = find_duplicates_within(an_dict_some_fields)
+    at_dups = find_duplicates_within(at_dict_some_fields)
+
+    all_members_keys = set(an_dict_all_fields.keys() + at_dict_all_fields.keys())
+    all_members = [an_dict_all_fields[key][0] if key in an_dict_all_fields else
+                   at_dict_all_fields[key][0] for key in all_members_keys]
+
+    merge_conflicts, needs_sync, up_to_date = find_duplicates_across(
+                                all_members, field_set,
+                                an_dict_all_fields, at_dict_all_fields,
+                                an_dict_some_fields, at_dict_some_fields)
+
+    print "#"*100
+    print "Based on %s, we have found:" % ', '.join(field_set)
+    print "#"*100
+    print "There are %d duplicated members in AirTable" % len(at_dups)
+    # print_duplicates_within(an_dups)
+    print "#"*100
+    print "There are %d duplicated members in ActionNetwork" % len(an_dups)
+    # print_duplicates_within(at_dups)
+    print "#"*100
+    print "There are %d members with merge conflicts" % len(merge_conflicts)
+    print "There are %d members that can be cleanly synced" % len(needs_sync)
+    print "There are %d members that are fully synced" % len(up_to_date)
+    # print_merge_conflicts(sorted(merge_conflicts))
+    # print_needs_sync(sorted(needs_sync), field_set, at_dict_some_fields, an_dict_some_fields)
+
+    print "#"*100
+    print "#"*100
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--an-api-key',
+                        help = 'API Key for Action Network',
+                        required = True)
+    parser.add_argument('--at-api-key',
+                        help = 'API Key for Airtable',
+                        required = True)
+    args = parser.parse_args()
+    an_token = args.an_api_key
+    at_token = args.at_api_key
+
+    an_connection = ANConnection(an_token)
+    an_members = an_connection.create_members()
+
+    at_connection = ATConnection(at_token)
+    at_members = at_connection.create_members()
+
+    print "Found %d members on ActionNetwork and %d members on AirTable" % (len(an_members), len(at_members))
+
+    equivalence_fields = [['last_name', 'first_name'],
+                          ['email_address']]
+    for field_set in equivalence_fields:
+        get_merge_info(an_members, at_members, field_set)
