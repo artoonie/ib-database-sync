@@ -1,4 +1,9 @@
-from contextlib import contextmanager
+"""
+Prints out conflicts between Indivisible Berkeley's AirTable
+and ActionNetwork databases.
+"""
+
+from math import sin, cos, sqrt, atan2, radians
 import os
 import hashlib
 import requests
@@ -7,9 +12,11 @@ import json
 import time
 import timeago
 
+trust+=1
 """ This class is sortable and hashable. Add additional fields as desired. """
 class Member(object):
-    def __init__(self, first_name, last_name, email_address, zip_code, last_edit, source_name):
+    def __init__(self, first_name, last_name, email_address,
+                 zip_code, last_edit, source_name):
         self.first_name = first_name
         self.last_name = last_name
         self.email_address = email_address
@@ -82,17 +89,32 @@ class Connection(object):
     def __init__(self, verbose):
         self.verbose = verbose
 
-    def make_request(self, cache_filename=None):
+    def request(self, href, params, headers):
+        try_count = 0
+        while try_count < 3:
+            try:
+                response = requests.get(href,
+                                        params = params,
+                                        headers = headers)
+                return response.json()
+            except Exception as e:
+                try_count += 1
+        raise RuntimeError("Tried thrice and failed to get url " + href +\
+                           "because of " + e.message)
+
+    def make_request(self, href, params, header, cache_filename=None):
         """ set cache_filename to enable caching of this result """
         if cache_filename is None or not os.path.exists(cache_filename):
             if self.verbose:
-                print("Requesting " + self.href)
-            response = requests.get(self.href,
-                                    params = self.params,
-                                    headers = self.header)
+                print("Requesting " + href)
+            json_response = self.request(href,
+                                         params = params,
+                                         headers = header)
             time.sleep(0.2) # Respect AirTable rate limiting rules
-            json_response = response.json()
             if cache_filename:
+                cache_directory = os.path.dirname(cache_filename)
+                if not os.path.exists(cache_directory):
+                    os.makedirs(cache_directory)
                 with open(cache_filename, 'w') as cached_json_fp:
                     json.dump(json_response, cached_json_fp,
                               sort_keys=True, indent=4)
@@ -113,6 +135,7 @@ class ANConnection(Connection):
         self.header = {'OSDI-API-Token': an_token}
         self.params = None
         self.href = 'https://actionnetwork.org/api/v2/people'
+        self.num_members_filtered = 0
 
     def _create_member_from(self, member_json):
         address = member_json['postal_addresses'][0]
@@ -124,23 +147,113 @@ class ANConnection(Connection):
             zip_code      = address.get('postal_code'),
             source_name   = "ActionNetwork")
 
+    def _filter_unimportant(self, members_json):
+        # Far away members who signed up to watch the Lakoff/Hochchild stream
+        # are not important and should really be purged from the database.
+        # Until then, we need to filter them out explicitly.
+        naughty_url = 'https://actionnetwork.org/forms/'\
+                      'live-stream-of-reaching-out-to-trump-voters'
+
+        def cache_filename_from_url(url):
+            splitter = 'actionnetwork.org/api/v2/'
+            cache_filename = url.split(splitter)[1]
+            return cache_filename.replace('/', '-')
+        def km_from_berkeley(lat, lon):
+            # https://stackoverflow.com/questions/19412462/
+            # getting-distance-between-two-points-based-on-latitude-longitude
+            R = 6373.0
+
+            lat1 = radians(abs(lat))
+            lon1 = radians(abs(lon))
+            lat2 = radians(abs(37.872483))
+            lon2 = radians(abs(-122.266359))
+
+            dlon = lon2 - lon1
+            dlat = lat2 - lat1
+
+            a = sin(dlat / 2)**2 + cos(lat1) * cos(lat2) * sin(dlon / 2)**2
+            c = 2 * atan2(sqrt(a), sqrt(1 - a))
+
+            distance = R * c
+            return distance
+
+        def did_only_fill_out_form(member):
+            forms_href = member['_links']['osdi:submissions']['href']
+            cache_filename = cache_filename_from_url(forms_href)
+            assert isinstance(cache_filename, basestring)
+
+            # 1. Download the "submissions" list
+            forms_json = self.make_request(
+                href = forms_href,
+                params = self.params,
+                header = self.header,
+                cache_filename = 'cache/an-submissions/' + cache_filename)
+            submissions =  forms_json['_embedded']['osdi:submissions']
+
+            if len(submissions) != 1:
+                return False
+
+            # 2. Download the "form" to see what's inside
+            submission = submissions[0]
+            form_href = submission['_links']['osdi:form']['href']
+            cache_filename = cache_filename_from_url(form_href)
+            form_json = self.make_request(
+                href = form_href,
+                params = self.params,
+                header = self.header,
+                cache_filename = 'cache/an-forms/' + cache_filename)
+
+            try:
+                return form_json['browser_url'] == naughty_url
+            except KeyError as e:
+                if self.verbose:
+                    print "While trying to download form", form_href
+                    print "We received an error:", e.message
+                    print "The data returned from the server is:"
+                    print form_json
+                return False
+
+        def is_far_away(member):
+            loc = member['postal_addresses'][0]['location']
+            lat = loc['latitude']
+            lon = loc['longitude']
+            if lat is None or lon is None:
+                # Err on the side of keeping a member whose address is unknown
+                return False
+            return km_from_berkeley(float(lat), float(lon)) > 50
+
+        filtered_members = [m for m in members_json if
+                       not is_far_away(m) or not did_only_fill_out_form(m)]
+        #for m in members_json:
+        #    if not is_far_away(m):
+        #        print "member is not far away"
+        #    if not did_only_fill_out_form(m):
+        #        print "member filled out more than just one"
+        self.num_members_filtered += len(members_json)-len(filtered_members)
+        return filtered_members
+
     def _create_members_from(self, an_json):
         members_json = an_json['_embedded']['osdi:people']
+        members_json = self._filter_unimportant(members_json)
         return [self._create_member_from(x) for x in members_json]
 
     def create_members(self):
-        """ Note: destructive; destroys self.href """
         members = []
         page = 0
+        href = self.href
         while True:
-            an_json = self.make_request('an_cache_%s.json' % page)
+            an_json = self.make_request(
+                              href = href,
+                              params = self.params,
+                              header = self.header,
+                              cache_filename = 'cache/an_cache_%s.json' % page)
             members.extend(self._create_members_from(an_json))
 
-            self.href = an_json
+            href = an_json
             if 'next' not in an_json['_links']:
                 return members
 
-            self.href = an_json['_links']['next']['href']
+            href = an_json['_links']['next']['href']
             page += 1
             assert page < 500 # safety check
 
@@ -175,18 +288,21 @@ class ATConnection(Connection):
         return [self._create_member_from(x['fields']) for x in members_json]
 
     def create_members(self):
-        """ Note: destructive; destroys self.params """
         members = []
         page = 0
+        params = dict(self.params) # make a copy
         while True:
-            at_json = self.make_request('at_cache_%s.json' % page)
+            at_json = self.make_request(
+                              href = self.href,
+                              params = params,
+                              header = self.header,
+                              cache_filename = 'cache/at_cache_%s.json' % page)
             members.extend(self._create_members_from(at_json))
 
             if 'offset' not in at_json:
-                print("Loaded %d members from AirTable" % len(members))
                 return members
 
-            self.params['offset'] = at_json['offset']
+            params['offset'] = at_json['offset']
             page += 1
             assert page < 500 # safety check
 
@@ -299,8 +415,11 @@ def print_needs_sync(needs_sync, field_set,
             assert False
 
 def get_merge_info(an_members, at_members, equivalence_fields, verbose):
+    # Collisions in all_fields means that the two members are exact copies
     an_dict_all_fields  = hash_members(an_members, None)
     at_dict_all_fields  = hash_members(at_members, None)
+    # Collisions in some_fields means that the two members share field_set
+    # but may (or may not) share other data.
     an_dict_some_fields = hash_members(an_members, field_set)
     at_dict_some_fields = hash_members(at_members, field_set)
 
@@ -340,9 +459,9 @@ def get_merge_info(an_members, at_members, equivalence_fields, verbose):
     print "There are %d members that can be cleanly synced" % len(needs_sync)
     print "There are %d members that are fully synced" % len(up_to_date)
     if verbose:
-        print_merge_conflicts(sorted(merge_conflicts))
         print_needs_sync(sorted(needs_sync), field_set,
                          at_dict_some_fields, an_dict_some_fields)
+        print_merge_conflicts(sorted(unresolved_conflicts))
 
     if verbose:
         print "#"*100
@@ -374,6 +493,10 @@ if __name__ == "__main__":
 
     print "Found %d members on ActionNetwork and %d members on AirTable" % \
             (len(an_members), len(at_members))
+
+    print "We filtered out %d/%d members from ActionNetwork." % \
+            (an_connection.num_members_filtered,
+             len(an_members)+an_connection.num_members_filtered)
 
     """ Each row here defines an equivalence, meaning, a user with the
         same first AND last name, OR the same email, are considered to be the
