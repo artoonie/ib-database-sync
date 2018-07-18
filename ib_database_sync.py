@@ -3,24 +3,27 @@ Prints out conflicts between Indivisible Berkeley's AirTable
 and ActionNetwork databases.
 """
 
-from math import sin, cos, sqrt, atan2, radians
 import os
-import hashlib
-import requests
-import argparse
-import json
 import time
+
+from math import sin, cos, sqrt, atan2, radians
+import argparse
+import hashlib
+import json
+import requests
 import timeago
 
-trust+=1
-""" This class is sortable and hashable. Add additional fields as desired. """
 class Member(object):
+    """ This class is sortable and hashable. Add additional fields as desired. """
     def __init__(self, first_name, last_name, email_address,
                  zip_code, last_edit, source_name):
-        self.first_name = first_name
-        self.last_name = last_name
-        self.email_address = email_address
-        self.zip_code = zip_code
+        def t(s):
+            if s is None: return s
+            return s.lower().strip()
+        self.first_name     = t(first_name)
+        self.last_name      = t(last_name)
+        self.email_address  = t(email_address)
+        self.zip_code       = t(zip_code)
 
         # Equality Fields are a list of fields of Member for which two
         # objects will be considered if all of these fields are equal.
@@ -32,7 +35,7 @@ class Member(object):
         self.source_name = source_name
         self.dirty = False
 
-    def hash_with(self, only_these_fields = None):
+    def hash_with(self, only_these_fields=None):
         """ Gets a unique hash using only_these_fields. If left as the default
             None, uses all available fields. """
         if only_these_fields is None:
@@ -57,7 +60,7 @@ class Member(object):
                  "<"+unicode(self.email_address)+">",
                  self.zip_code)
 
-    def _isEq(self, other, field):
+    def _is_eq(self, other, field):
         this = self.__dict__[field]
         that = other.__dict__[field]
         if this == that: return True
@@ -65,7 +68,7 @@ class Member(object):
         return this.lower() == that.lower()
 
     def __eq__(self, other):
-        return all([self._isEq(other, field) for field in self.equality_fields])
+        return all([self._is_eq(other, field) for field in self.equality_fields])
 
     def __str__(self):
         d = dict([(key, self.__dict__[key]) for key in self.equality_fields])
@@ -76,7 +79,7 @@ class Member(object):
         equality_fields_sorted = sorted(self.equality_fields,
                                         key=lambda x: sort_order.index(x))
         for field in equality_fields_sorted:
-            if self._isEq(other, field):
+            if self._is_eq(other, field):
                 continue
             else:
                 return self.__dict__[field] < other.__dict__[field]
@@ -243,10 +246,10 @@ class ANConnection(Connection):
         href = self.href
         while True:
             an_json = self.make_request(
-                              href = href,
-                              params = self.params,
-                              header = self.header,
-                              cache_filename = 'cache/an_cache_%s.json' % page)
+                href = href,
+                params = self.params,
+                header = self.header,
+                cache_filename = 'cache/an_cache_%s.json' % page)
             members.extend(self._create_members_from(an_json))
 
             href = an_json
