@@ -310,17 +310,33 @@ class ATConnection(Connection):
             assert page < 500 # safety check
 
 class MergeConflict(object):
-    def __init__(self, members):
+    def __init__(self, members, resolvers):
         self.members = members
+        self.resolvers = resolvers
 
-    def phase0_resolve_empties(self):
+    def resolve(self):
+        for resolver in self.resolvers:
+            if resolver.resolve(self.members, self.members[0].equality_fields):
+                return True
+        return False
+
+class ConflictResolver(object):
+    def __init__(self): pass
+
+    def resolve(self, conflict): assert False # override this
+
+    def is_any_conflict(self, members, field):
+        values = [m.get(field) for m in members]
+        return not all([v == values[0] for v in values])
+
+class MissingFieldResolver(ConflictResolver):
+    def resolve(self, members, equality_fields):
         all_conflicts_resolved = True
-        for field in self.members[0].equality_fields:
-            values = [m.get(field) for m in self.members]
-            if all([v == values[0] for v in values]):
-                # No conflict
+        for field in equality_fields:
+            if not self.is_any_conflict(members, field):
                 continue
 
+            values = [m.get(field) for m in members]
             is_none  = [v for v in values if v is None]
             not_none = [v for v in values if v is not None]
             if len(not_none) > 1:
@@ -331,12 +347,87 @@ class MergeConflict(object):
             assert len(not_none) == 1
             real_value = not_none[0]
 
-            for member in self.members:
+            for member in members:
                 member.set(field, real_value)
+        if all_conflicts_resolved:
+            print "Automatically resolved conflict: "
+            print members[0].prettystring()
+            print
         return all_conflicts_resolved
 
-    def resolve(self):
-        return self.phase0_resolve_empties()
+class UserQuit(Exception): pass
+class ManualResolver(ConflictResolver):
+    def prompt_field(self, members, field):
+        for i, member in enumerate(members):
+            print "[%d] %15s: %s = %s" % (i+1, member.source_name, field, member.get(field))
+        print "[c] custom"
+        print "[q] quit"
+        print
+
+    def prompt(self, members):
+        print "How would you like to resolve this conflict?:"
+        for i, member in enumerate(members):
+            print "[%d] %15s: %s" % (i+1, member.source_name, member.prettystring())
+        print "[s] split"
+        print "[n] next conflict (skip)"
+        print "[q] quit"
+        print
+
+    def set_field_to(self, field, members, selected_member_i):
+        for member in members:
+            member.set(field, members[selected_member_i].get(field))
+
+    def set_every_field_to(self, equality_fields, members, selected_member_i):
+        for field in equality_fields:
+            self.set_field_to(field, members, selected_member_i)
+
+    def which_member_was_chosen(self, members, option):
+        """ Returns int(option) if it's within len(members), else None,
+            one-indexed. """
+        for i in xrange(len(members)):
+            if option == str(i+1):
+                return i
+        return None
+
+    def resolve_field(self, members, field):
+        self.prompt_field(members, field)
+        option = raw_input('choose option $> ')
+        if option == 'q':
+            raise UserQuit();
+        elif option == 'c':
+            user_input = raw_input('enter custom text $> ')
+            for member in members:
+                member.set(field, user_input)
+            return True
+
+        i = self.which_member_was_chosen(members, option)
+        if i is None:
+            print "Invalid Check"
+            self.resolve_field(members, field)
+        else:
+            self.set_field_to(field, members, i)
+
+    def resolve(self, members, equality_fields):
+        self.prompt(members)
+        option = raw_input('choose option $> ')
+
+        if option == 'n':
+            return False
+        elif option == 'q':
+            raise UserQuit()
+        elif option == 's':
+            for field in equality_fields:
+                if self.is_any_conflict(members, field):
+                    self.resolve_field(members, field)
+            return True
+        else:
+            i = self.which_member_was_chosen(members, option)
+            if i is None:
+                print "Invalid choice"
+                return self.resolve(members, equality_fields)
+            else:
+                self.set_every_field_to(equality_fields, members, i)
+                return True
 
 def hash_members(members, field_set):
     d = {}
@@ -365,6 +456,8 @@ def find_duplicates_across(all_members, field_set,
     needs_sync = []
     up_to_date = []
 
+    resolvers = [MissingFieldResolver(), ManualResolver()]
+
     for member in all_members:
         key_in_all = member.hash_with(None)
         key_in_some = member.hash_with(field_set)
@@ -380,7 +473,7 @@ def find_duplicates_across(all_members, field_set,
             if is_in_at_some and is_in_an_some:
                 members_conflicted = an_dict_some_fields[key_in_some] +\
                                      at_dict_some_fields[key_in_some]
-                conflict = MergeConflict(members_conflicted)
+                conflict = MergeConflict(members_conflicted, resolvers)
                 merge_conflicts.append(conflict)
             elif is_in_at_some and not is_in_an_some:
                 needs_sync.append(member)
@@ -401,9 +494,14 @@ def print_merge_conflicts(merge_conflicts):
 
 def resolve_merge_conflicts(merge_conflicts):
     unresolved = []
-    for merge_conflict in merge_conflicts:
-        if not merge_conflict.resolve():
-            unresolved.append(merge_conflict)
+    for i, merge_conflict in enumerate(merge_conflicts):
+        try:
+            wasResolved = merge_conflict.resolve()
+            if not wasResolved:
+                unresolved.append(merge_conflict)
+        except UserQuit:
+            unresolved = unresolved + merge_conflicts[i:]
+            break
     return unresolved
 
 def print_needs_sync(needs_sync, field_set,
@@ -438,8 +536,6 @@ def get_merge_info(an_members, at_members, equivalence_fields, verbose):
                                 an_dict_all_fields, at_dict_all_fields,
                                 an_dict_some_fields, at_dict_some_fields)
 
-    unresolved_conflicts = resolve_merge_conflicts(merge_conflicts)
-
     if verbose:
         print "#"*100
         print "#"*100
@@ -458,7 +554,12 @@ def get_merge_info(an_members, at_members, equivalence_fields, verbose):
     if verbose:
         print "#"*100
     print "There are %d merge conflicts" % len(merge_conflicts)
-    print " of which %d require manual resolution." % len(unresolved_conflicts)
+    print
+    print
+
+    unresolved_conflicts = resolve_merge_conflicts(merge_conflicts)
+
+    print "%d/%d conflicts were unresolved." % (len(unresolved_conflicts), len(merge_conflicts))
     print "There are %d members that can be cleanly synced" % len(needs_sync)
     print "There are %d members that are fully synced" % len(up_to_date)
     if verbose:
