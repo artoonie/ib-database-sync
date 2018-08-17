@@ -14,23 +14,15 @@ import requests
 import timeago
 
 class Member(object):
-    """ This class is sortable and hashable. Add additional fields as desired. """
     def __init__(self, first_name, last_name, email_address,
-                 zip_code, last_edit, source_name):
-        def t(s):
-            if s is None: return s
-            return s.lower().strip()
-        self.first_name     = t(first_name)
-        self.last_name      = t(last_name)
-        self.email_address  = t(email_address)
-        self.zip_code       = t(zip_code)
-
-        # Equality Fields are a list of fields of Member for which two
-        # objects will be considered if all of these fields are equal.
-        # This is supported by sorting, hashing, and comparisons.
-        self.equality_fields = self.__dict__.keys()
+                 zip_code, last_edit, source_name, unique_id):
+        self.first_name     = first_name
+        self.last_name      = last_name
+        self.email_address  = email_address
+        self.zip_code       = zip_code
 
         # Everything below this line will not be a part of the equality fields
+        self.unique_id = unique_id
         self.last_edit = last_edit
         self.source_name = source_name
         self.dirty = False
@@ -60,18 +52,32 @@ class Member(object):
                  "<"+unicode(self.email_address)+">",
                  self.zip_code)
 
+class HashFriendlyMember(Member):
+    """ This class is sortable and hashable based on equality_fields.
+        It will be considered equal to another HashFriendlyMember if all
+        equality_fields are equal, ignoring the equality of other fields. """
+    def __init__(self, *args, **kwargs):
+        super(HashFriendlyMember, self).__init__(*args, **kwargs)
+
+        self.equality_fields = ['first_name', 'last_name', 'email_address', 'zip_code']
+
+    def _clean(cls, s):
+        """ prepare a string for comparison: convert to lower case and strip """
+        if not isinstance(s, basestring): return s
+        return s.lower().strip()
+
     def _is_eq(self, other, field):
-        this = self.__dict__[field]
-        that = other.__dict__[field]
+        this = self._clean(self.__dict__[field])
+        that = self._clean(other.__dict__[field])
         if this == that: return True
         if this is None or that is None: return False
-        return this.lower() == that.lower()
+        return this == that
 
     def __eq__(self, other):
         return all([self._is_eq(other, field) for field in self.equality_fields])
 
     def __str__(self):
-        d = dict([(key, self.__dict__[key]) for key in self.equality_fields])
+        d = dict([(key, self._clean(self.__dict__[key])) for key in self.equality_fields])
         return str(d)
 
     def __lt__(self, other):
@@ -142,12 +148,13 @@ class ANConnection(Connection):
 
     def _create_member_from(self, member_json):
         address = member_json['postal_addresses'][0]
-        return Member(
+        return HashFriendlyMember(
             email_address = member_json['email_addresses'][0]['address'],
             last_edit     = member_json['modified_date'],
             first_name    = member_json.get('given_name'),
             last_name     = member_json.get('family_name'),
             zip_code      = address.get('postal_code'),
+            unique_id     = member_json['identifiers'][0],
             source_name   = "ActionNetwork")
 
     def _filter_unimportant(self, members_json):
@@ -264,7 +271,8 @@ class ATConnection(Connection):
     fields_to_request = ('Email Address',
                          'First Name',
                          'Last Name',
-                         'Zip code')
+                         'Zip code',
+                         'id')
 
     def __init__(self, at_token, verbose):
         super(ATConnection, self).__init__(verbose)
@@ -275,20 +283,22 @@ class ATConnection(Connection):
 
     def _create_member_from(self, member_json):
         # TODO: Can we get the modified time instead of created?
-        last_edit = member_json.get('createdTime', None)
+        fields = member_json['fields']
+        last_edit = fields.get('createdTime', None)
 
-        return Member(
-            email_address = member_json.get(self.fields_to_request[0]),
-            first_name    = member_json.get(self.fields_to_request[1]),
-            last_name     = member_json.get(self.fields_to_request[2]),
-            zip_code      = member_json.get(self.fields_to_request[3]),
+        return HashFriendlyMember(
+            email_address = fields.get(self.fields_to_request[0]),
+            first_name    = fields.get(self.fields_to_request[1]),
+            last_name     = fields.get(self.fields_to_request[2]),
+            zip_code      = fields.get(self.fields_to_request[3]),
             last_edit     = last_edit,
+            unique_id     = member_json["id"],
             source_name   = "AirTable")
 
 
     def _create_members_from(self, at_json):
         members_json = at_json['records']
-        return [self._create_member_from(x['fields']) for x in members_json]
+        return [self._create_member_from(x) for x in members_json]
 
     def create_members(self):
         members = []
@@ -499,7 +509,7 @@ def resolve_merge_conflicts(merge_conflicts):
             wasResolved = merge_conflict.resolve()
             if not wasResolved:
                 unresolved.append(merge_conflict)
-        except UserQuit:
+        except (UserQuit, KeyboardInterrupt):
             unresolved = unresolved + merge_conflicts[i:]
             break
     return unresolved
