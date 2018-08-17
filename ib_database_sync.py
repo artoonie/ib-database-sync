@@ -4,8 +4,69 @@ and ActionNetwork databases.
 """
 
 import argparse
+from tqdm import tqdm
 
 from connections import ANConnection, ATConnection
+from records import Member
+
+def msg(s="", end='\n'):
+    tqdm.write(s, end=end)
+
+class Prompter(object):
+    def __init__(self, title):
+        self._title = title
+        self._options = []
+        self._members = []
+
+    def add_option(self, key, description):
+        self._options.append((str(key), description))
+
+    def _add_member_helper(self, member, desc):
+        member_i = 1 + len(self._members)
+        self.add_option(member_i, desc)
+        self._members.append(member)
+
+    def add_next(self):
+        self.add_option('n', 'next conflict (skip)')
+
+    def add_quit(self):
+        self.add_option('q', 'quit')
+
+    def add_member(self, member):
+        desc = "%15s: %s" % (member.source_name, member.prettystring())
+        self._add_member_helper(member, desc)
+
+    def add_member_field(self, member, field):
+        desc = "%15s: %s = %s" % (member.source_name, field, member.get(field))
+        self._add_member_helper(member, desc)
+
+    def prompt(self):
+        msg(self._title)
+        for key, description in self._options:
+            msg("[%s] %s" % (key, description))
+
+        try:
+            msg('choose option $> ', end='')
+            option = raw_input()
+        except KeyboardInterrupt:
+            if 'q' in self._options:
+                return 'q'
+            else:
+                raise
+        msg()
+
+        try:
+            i = int(option)
+            if i >= 1 and i <= len(self._members):
+                return self._members[i-1]
+        except ValueError:
+            pass
+
+        if option in [key for key,_ in self._options]:
+            return option
+
+        msg("Invalid choice")
+        return self.prompt()
 
 class MergeConflict(object):
     def __init__(self, members, resolvers):
@@ -48,48 +109,40 @@ class MissingFieldResolver(ConflictResolver):
             for member in members:
                 member.set(field, real_value)
         if all_conflicts_resolved:
-            print "Automatically resolved conflict: "
-            print members[0].prettystring()
-            print
+            msg("Automatically resolved conflict: ")
+            msg(members[0].prettystring())
+            msg()
         return all_conflicts_resolved
 
 class UserQuit(Exception): pass
 class ManualResolver(ConflictResolver):
     def prompt_field(self, members, field):
-        for i, member in enumerate(members):
-            print "[%d] %15s: %s = %s" % (i+1, member.source_name, field, member.get(field))
-        print "[c] custom"
-        print "[q] quit"
-        print
+        prompter = Prompter("Which field is correct?")
+        for member in members:
+            prompter.add_member_field(member, field)
+        prompter.add_option('c', 'custom')
+        prompter.add_quit()
+        return prompter.prompt()
 
     def prompt(self, members):
-        print "How would you like to resolve this conflict?:"
-        for i, member in enumerate(members):
-            print "[%d] %15s: %s" % (i+1, member.source_name, member.prettystring())
-        print "[s] split"
-        print "[n] next conflict (skip)"
-        print "[q] quit"
-        print
-
-    def set_field_to(self, field, members, selected_member_i):
+        prompter = Prompter("Which member contains correct data?")
         for member in members:
-            member.set(field, members[selected_member_i].get(field))
+            prompter.add_member(member)
+        prompter.add_option('s', 'split into fields')
+        prompter.add_next()
+        prompter.add_quit()
+        return prompter.prompt()
 
-    def set_every_field_to(self, equality_fields, members, selected_member_i):
+    def set_field_to(self, field, members, selected_member):
+        for member in members:
+            member.set(field, selected_member.get(field))
+
+    def set_every_field_to(self, equality_fields, members, selected_member):
         for field in equality_fields:
-            self.set_field_to(field, members, selected_member_i)
-
-    def which_member_was_chosen(self, members, option):
-        """ Returns int(option) if it's within len(members), else None,
-            one-indexed. """
-        for i in xrange(len(members)):
-            if option == str(i+1):
-                return i
-        return None
+            self.set_field_to(field, members, selected_member)
 
     def resolve_field(self, members, field):
-        self.prompt_field(members, field)
-        option = raw_input('choose option $> ')
+        option = self.prompt_field(members, field)
         if option == 'q':
             raise UserQuit();
         elif option == 'c':
@@ -97,17 +150,12 @@ class ManualResolver(ConflictResolver):
             for member in members:
                 member.set(field, user_input)
             return True
-
-        i = self.which_member_was_chosen(members, option)
-        if i is None:
-            print "Invalid selection."
-            self.resolve_field(members, field)
         else:
-            self.set_field_to(field, members, i)
+            assert(isinstance(option, Member))
+            self.set_field_to(field, members, option)
 
     def resolve(self, members, equality_fields):
-        self.prompt(members)
-        option = raw_input('choose option $> ')
+        option = self.prompt(members)
 
         if option == 'n':
             return False
@@ -119,37 +167,76 @@ class ManualResolver(ConflictResolver):
                     self.resolve_field(members, field)
             return True
         else:
-            i = self.which_member_was_chosen(members, option)
-            if i is None:
-                print "Invalid choice"
-                return self.resolve(members, equality_fields)
-            else:
-                self.set_every_field_to(equality_fields, members, i)
-                return True
+            assert(isinstance(option, Member))
+            self.set_every_field_to(equality_fields, members, option)
+            return True
 
-def hash_members(members, field_set):
+class Action(object):
+    def __init__(self, member):
+        self.member = member
+
+class CreateAction(Action): pass
+class DeleteAction(Action): pass
+class UpdateAction(Action): pass
+
+def hash_members(members, equivalence_fields):
     d = {}
     for m in members:
-        key = m.hash_with(field_set)
+        key = m.hash_with(equivalence_fields)
         if key not in d:
             d[key] = []
         if key in d:
             d[key].append(m)
     return d
 
-def find_duplicates_within(hashed_members):
-    hm = hashed_members
+def find_duplicates(members, equivalence_fields):
+    hm = hash_members(members, equivalence_fields)
     return [hm[key] for key in hm if len(hm[key]) > 1]
+
+def resolve_duplicates(duplicates):
+    actions = []
+    for i, curr_duplicates in enumerate(duplicates):
+        prompter = Prompter("[%d/%d] Which of these duplicates should be kept?"\
+            " (The rest will be deleted)" % (i+1, len(duplicates)))
+        for member in curr_duplicates:
+            prompter.add_member(member)
+        prompter.add_next()
+        prompter.add_quit()
+        option = prompter.prompt()
+        if option == 'n':
+            continue
+        elif option == 'q':
+            break
+        else:
+            actions.extend([DeleteAction(m) for m in curr_duplicates if m != option])
+    return actions
 
 def print_duplicates_within(dups):
     for dup_list in dups:
         for member in dup_list:
-            print member.prettystring()
-        print
+            msg(member.prettystring())
+        msg()
 
-def find_duplicates_across(all_members, field_set,
-                           an_dict_all_fields,  at_dict_all_fields,
-                           an_dict_some_fields, at_dict_some_fields):
+def find_duplicates_across(an_members,  at_members, equivalence_fields):
+    # Collisions in all_fields means that the two members are exact copies
+    an_dict_all_fields  = hash_members(an_members, None)
+    at_dict_all_fields  = hash_members(at_members, None)
+
+    # Collisions in some_fields means that the two members share equivalence_fields
+    # but may (or may not) share other data.
+    an_dict_some_fields = hash_members(an_members, equivalence_fields)
+    at_dict_some_fields = hash_members(at_members, equivalence_fields)
+
+    # all_members contains ??
+    all_members_keys = set(an_dict_all_fields.keys()+at_dict_all_fields.keys())
+    all_members = []
+    for key in all_members_keys:
+        if key in an_dict_all_fields:
+            all_members.append(an_dict_all_fields[key][0])
+        else:
+            all_members.append(at_dict_all_fields[key][0])
+
+
     merge_conflicts = []
     needs_sync = []
     up_to_date = []
@@ -158,7 +245,7 @@ def find_duplicates_across(all_members, field_set,
 
     for member in all_members:
         key_in_all = member.hash_with(None)
-        key_in_some = member.hash_with(field_set)
+        key_in_some = member.hash_with(equivalence_fields)
 
         is_in_at_all = key_in_all in at_dict_all_fields
         is_in_an_all = key_in_all in an_dict_all_fields
@@ -179,16 +266,14 @@ def find_duplicates_across(all_members, field_set,
                 needs_sync.append(member)
             else:
                 assert False
-        else:
-            up_to_date.append(member)
     return merge_conflicts, needs_sync, up_to_date
 
 def print_merge_conflicts(merge_conflicts):
     for conflict in merge_conflicts:
         for member in conflict.members:
             name = member.source_name
-            print "%30s has:" % name, member.prettystring()
-        print
+            msg("%30s has:" % name, member.prettystring())
+        msg()
 
 def resolve_merge_conflicts(merge_conflicts):
     unresolved = []
@@ -197,77 +282,68 @@ def resolve_merge_conflicts(merge_conflicts):
             wasResolved = merge_conflict.resolve()
             if not wasResolved:
                 unresolved.append(merge_conflict)
-        except (UserQuit, KeyboardInterrupt):
+        except UserQuit:
             unresolved = unresolved + merge_conflicts[i:]
             break
     return unresolved
 
-def print_needs_sync(needs_sync, field_set,
+def print_needs_sync(needs_sync, equivalence_fields,
                      at_dict_some_fields, an_dict_some_fields):
     for member in needs_sync:
-        key = member.hash_with(field_set)
+        key = member.hash_with(equivalence_fields)
         if key not in at_dict_some_fields:
-            print "     Airtable is missing member", member.prettystring()
+            msg("     Airtable is missing member", member.prettystring())
         elif key not in an_dict_some_fields:
-            print "ActionNetwork is missing member", member.prettystring()
+            msg("ActionNetwork is missing member", member.prettystring())
         else:
             assert False
 
 def get_merge_info(an_members, at_members, equivalence_fields, verbose):
-    # Collisions in all_fields means that the two members are exact copies
-    an_dict_all_fields  = hash_members(an_members, None)
-    at_dict_all_fields  = hash_members(at_members, None)
-    # Collisions in some_fields means that the two members share field_set
-    # but may (or may not) share other data.
-    an_dict_some_fields = hash_members(an_members, field_set)
-    at_dict_some_fields = hash_members(at_members, field_set)
+    an_dups = find_duplicates(an_members, equivalence_fields)
+    at_dups = find_duplicates(at_members, equivalence_fields)
 
-    an_dups = find_duplicates_within(an_dict_some_fields)
-    at_dups = find_duplicates_within(at_dict_some_fields)
-
-    all_members_keys = set(an_dict_all_fields.keys()+at_dict_all_fields.keys())
-    all_members = [an_dict_all_fields[key][0] if key in an_dict_all_fields else
-                   at_dict_all_fields[key][0] for key in all_members_keys]
+    msg("There are %d duplicate members to resolve in ActionNetwork")
 
     merge_conflicts, needs_sync, up_to_date = find_duplicates_across(
-                                all_members, field_set,
-                                an_dict_all_fields, at_dict_all_fields,
-                                an_dict_some_fields, at_dict_some_fields)
+                                an_members, at_members, equivalence_fields)
 
     if verbose:
-        print "#"*100
-        print "#"*100
+        msg("#"*100)
+        msg("#"*100)
 
-    print
-    print "Based on %s, we have found:" % ', '.join(field_set)
+    msg()
+    msg("Based on %s, we have found:" % ', '.join(equivalence_fields))
     if verbose:
-        print "#"*100
-    print "There are %d duplicated members in AirTable" % len(at_dups)
+        msg("#"*100)
+    msg("There are %d duplicated members in AirTable" % len(at_dups))
     if verbose:
         print_duplicates_within(an_dups)
-        print "#"*100
-    print "There are %d duplicated members in ActionNetwork" % len(an_dups)
+        msg("#"*100)
+    msg("There are %d duplicated members in ActionNetwork" % len(an_dups))
     if verbose:
         print_duplicates_within(at_dups)
     if verbose:
-        print "#"*100
-    print "There are %d merge conflicts" % len(merge_conflicts)
-    print
-    print
+        msg("#"*100)
 
+    msg("There are %d merge conflicts" % len(merge_conflicts))
+    msg()
+    msg()
+
+    actions = resolve_duplicates(an_dups)
+    actions = resolve_duplicates(at_dups)
     unresolved_conflicts = resolve_merge_conflicts(merge_conflicts)
 
-    print "%d/%d conflicts were unresolved." % (len(unresolved_conflicts), len(merge_conflicts))
-    print "There are %d members that can be cleanly synced" % len(needs_sync)
-    print "There are %d members that are fully synced" % len(up_to_date)
+    msg("%d/%d conflicts were unresolved." % (len(unresolved_conflicts), len(merge_conflicts)))
+    msg("There are %d members that can be cleanly synced" % len(needs_sync))
+    msg("There are %d members that are fully synced" % len(up_to_date))
     if verbose:
-        print_needs_sync(sorted(needs_sync), field_set,
+        print_needs_sync(sorted(needs_sync), equivalence_fields,
                          at_dict_some_fields, an_dict_some_fields)
         print_merge_conflicts(sorted(unresolved_conflicts))
 
     if verbose:
-        print "#"*100
-        print "#"*100
+        msg("#"*100)
+        msg("#"*100)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -293,17 +369,17 @@ if __name__ == "__main__":
     at_connection = ATConnection(at_token, verbose)
     at_members = at_connection.create_members()
 
-    print "Found %d members on ActionNetwork and %d members on AirTable" % \
-            (len(an_members), len(at_members))
+    msg("Found %d members on ActionNetwork and %d members on AirTable" % \
+            (len(an_members), len(at_members)))
 
-    print "We filtered out %d/%d members from ActionNetwork." % \
+    msg("We filtered out %d/%d members from ActionNetwork." % \
             (an_connection.num_members_filtered,
-             len(an_members)+an_connection.num_members_filtered)
+             len(an_members)+an_connection.num_members_filtered))
 
     """ Each row here defines an equivalence, meaning, a user with the
         same first AND last name, OR the same email, are considered to be the
         same user. Add rows to add additional equivalences."""
-    equivalence_fields = [['last_name', 'first_name'],
-                          ['email_address']]
-    for field_set in equivalence_fields:
-        get_merge_info(an_members, at_members, field_set, verbose)
+    all_equivalence_fields = [['last_name', 'first_name'],
+                              ['email_address']]
+    for equivalence_fields in all_equivalence_fields:
+        get_merge_info(an_members, at_members, equivalence_fields, verbose)

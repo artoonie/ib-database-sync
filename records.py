@@ -48,26 +48,29 @@ class HashFriendlyMember(Member):
             None, uses all available fields. """
         if only_these_fields is None:
             only_these_fields = self.equality_fields
-        d = dict([(key, self.__dict__[key]) for key in only_these_fields])
+        d = dict([(field, self.get_clean(field)) for field in only_these_fields])
         return str(d)
 
-    def _clean(cls, s):
+    def get_clean(self, field):
         """ prepare a string for comparison: convert to lower case and strip """
+        s = self.get(field)
         if not isinstance(s, basestring): return s
         return s.lower().strip()
 
     def _is_eq(self, other, field):
-        this = self._clean(self.__dict__[field])
-        that = self._clean(other.__dict__[field])
+        this = self.get_clean(field)
+        that = other.get_clean(field)
         if this == that: return True
         if this is None or that is None: return False
         return this == that
 
     def __eq__(self, other):
+        if not isinstance(other, HashFriendlyMember):
+            return False
         return all([self._is_eq(other, field) for field in self.equality_fields])
 
     def __str__(self):
-        d = dict([(key, self._clean(self.__dict__[key])) for key in self.equality_fields])
+        d = dict([(field, self.get_clean(field)) for field in self.equality_fields])
         return str(d)
 
     def __lt__(self, other):
@@ -78,7 +81,7 @@ class HashFriendlyMember(Member):
             if self._is_eq(other, field):
                 continue
             else:
-                return self.__dict__[field] < other.__dict__[field]
+                return self.get_clean(field) < self.get_clean(field)
         return False
 
     def __hash__(self):
