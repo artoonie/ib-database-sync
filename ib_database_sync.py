@@ -4,6 +4,7 @@ and ActionNetwork databases.
 """
 
 import argparse
+import json
 from tqdm import tqdm
 
 from connections import ANConnection, ATConnection
@@ -49,7 +50,7 @@ class Prompter(object):
             msg('choose option $> ', end='')
             option = raw_input()
         except KeyboardInterrupt:
-            if 'q' in self._options:
+            if 'q' in [key for key,_ in self._options]:
                 return 'q'
             else:
                 raise
@@ -73,11 +74,21 @@ class MergeConflict(object):
         self.members = members
         self.resolvers = resolvers
 
+        for member in self.members:
+            assert not member.dirty
+
     def resolve(self):
         for resolver in self.resolvers:
             if resolver.resolve(self.members, self.members[0].equality_fields):
                 return True
         return False
+
+    def get_actions(self):
+        actions = []
+        for member in self.members:
+            if member.dirty:
+                actions.append(UpdateAction(member))
+        return actions
 
 class ConflictResolver(object):
     def __init__(self): pass
@@ -175,9 +186,21 @@ class Action(object):
     def __init__(self, member):
         self.member = member
 
-class CreateAction(Action): pass
-class DeleteAction(Action): pass
-class UpdateAction(Action): pass
+    def serialize(self):
+        return {'id': self.member.unique_id,
+                'action': self.action_name()}
+
+class CreateAction(Action):
+    def action_name(self):
+        return "create"
+
+class DeleteAction(Action):
+    def action_name(self):
+        return "delete"
+
+class UpdateAction(Action):
+    def action_name(self):
+        return "update"
 
 def hash_members(members, equivalence_fields):
     d = {}
@@ -195,9 +218,10 @@ def find_duplicates(members, equivalence_fields):
 
 def resolve_duplicates(duplicates):
     actions = []
-    for i, curr_duplicates in enumerate(duplicates):
-        prompter = Prompter("[%d/%d] Which of these duplicates should be kept?"\
-            " (The rest will be deleted)" % (i+1, len(duplicates)))
+    with tqdm(duplicates) as iterator:
+      for curr_duplicates in iterator:
+        prompter = Prompter("Which of these duplicates should be kept? "\
+                            "(The rest will be deleted)")
         for member in curr_duplicates:
             prompter.add_member(member)
         prompter.add_next()
@@ -276,16 +300,16 @@ def print_merge_conflicts(merge_conflicts):
         msg()
 
 def resolve_merge_conflicts(merge_conflicts):
-    unresolved = []
-    for i, merge_conflict in enumerate(merge_conflicts):
+    actions = []
+    with tqdm(merge_conflicts) as iterator:
+      for i, merge_conflict in enumerate(iterator):
         try:
             wasResolved = merge_conflict.resolve()
-            if not wasResolved:
-                unresolved.append(merge_conflict)
+            if wasResolved:
+                actions.extend(merge_conflict.get_actions())
         except UserQuit:
-            unresolved = unresolved + merge_conflicts[i:]
             break
-    return unresolved
+    return actions
 
 def print_needs_sync(needs_sync, equivalence_fields,
                      at_dict_some_fields, an_dict_some_fields):
@@ -297,6 +321,11 @@ def print_needs_sync(needs_sync, equivalence_fields,
             msg("ActionNetwork is missing member", member.prettystring())
         else:
             assert False
+
+def serialize_actions(actions, filename):
+    d = [action.serialize() for action in actions]
+    with open(filename, 'w') as f:
+        json.dump(d, f, indent=4)
 
 def get_merge_info(an_members, at_members, equivalence_fields, verbose):
     an_dups = find_duplicates(an_members, equivalence_fields)
@@ -329,11 +358,15 @@ def get_merge_info(an_members, at_members, equivalence_fields, verbose):
     msg()
     msg()
 
-    actions = resolve_duplicates(an_dups)
-    actions = resolve_duplicates(at_dups)
-    unresolved_conflicts = resolve_merge_conflicts(merge_conflicts)
+    actions = []
+    filename = "test.json"
+    try:
+        actions.extend(resolve_duplicates(an_dups))
+        actions.extend(resolve_duplicates(at_dups))
+        actions.extend(resolve_merge_conflicts(merge_conflicts))
+    finally:
+        serialize_actions(actions, filename)
 
-    msg("%d/%d conflicts were unresolved." % (len(unresolved_conflicts), len(merge_conflicts)))
     msg("There are %d members that can be cleanly synced" % len(needs_sync))
     msg("There are %d members that are fully synced" % len(up_to_date))
     if verbose:
