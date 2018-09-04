@@ -5,6 +5,8 @@ and ActionNetwork databases.
 
 import argparse
 import json
+import os
+import shutil
 from tqdm import tqdm
 
 from connections import ANConnection, ATConnection
@@ -74,10 +76,10 @@ class MergeConflict(object):
         self.members = members
         self.resolvers = resolvers
 
+    def resolve(self):
         for member in self.members:
             assert not member.dirty
 
-    def resolve(self):
         for resolver in self.resolvers:
             if resolver.resolve(self.members, self.members[0].equality_fields):
                 return True
@@ -187,8 +189,13 @@ class Action(object):
         self.member = member
 
     def serialize(self):
-        return {'id': self.member.unique_id,
-                'action': self.action_name()}
+        d = {'id': self.member.unique_id,
+             'action': self.action_name()}
+        d.update(self.additional_fields())
+        return d
+
+    def additional_fields(self):
+        return {}
 
 class CreateAction(Action):
     def action_name(self):
@@ -201,6 +208,9 @@ class DeleteAction(Action):
 class UpdateAction(Action):
     def action_name(self):
         return "update"
+
+    def additional_fields(self):
+        return self.member.original_dict
 
 def hash_members(members, equivalence_fields):
     d = {}
@@ -324,6 +334,13 @@ def print_needs_sync(needs_sync, equivalence_fields,
 
 def serialize_actions(actions, filename):
     d = [action.serialize() for action in actions]
+
+    if os.path.exists(filename):
+        i = 0
+        backup_filename_fmt = filename + "_%d"
+        while os.path.exists(backup_filename_fmt % i):
+            i += 1
+        shutil.copy2(filename, backup_filename_fmt % i)
     with open(filename, 'w') as f:
         json.dump(d, f, indent=4)
 
@@ -331,52 +348,27 @@ def get_merge_info(an_members, at_members, equivalence_fields, verbose):
     an_dups = find_duplicates(an_members, equivalence_fields)
     at_dups = find_duplicates(at_members, equivalence_fields)
 
-    msg("There are %d duplicate members to resolve in ActionNetwork")
-
-    merge_conflicts, needs_sync, up_to_date = find_duplicates_across(
-                                an_members, at_members, equivalence_fields)
-
-    if verbose:
-        msg("#"*100)
-        msg("#"*100)
-
     msg()
     msg("Based on %s, we have found:" % ', '.join(equivalence_fields))
-    if verbose:
-        msg("#"*100)
     msg("There are %d duplicated members in AirTable" % len(at_dups))
-    if verbose:
-        print_duplicates_within(an_dups)
-        msg("#"*100)
     msg("There are %d duplicated members in ActionNetwork" % len(an_dups))
-    if verbose:
-        print_duplicates_within(at_dups)
-    if verbose:
-        msg("#"*100)
-
-    msg("There are %d merge conflicts" % len(merge_conflicts))
     msg()
     msg()
 
     actions = []
-    filename = "test.json"
+    filename = "actions.json"
     try:
         actions.extend(resolve_duplicates(an_dups))
         actions.extend(resolve_duplicates(at_dups))
+
+        # Merge conflicts depend on how the above was resolved. Don't look at dirty members.
+        an_members_clean = [m for m in an_members if not m.dirty]
+        at_members_clean = [m for m in at_members if not m.dirty]
+        merge_conflicts, needs_sync, up_to_date = find_duplicates_across(
+                    an_members_clean, at_members_clean, equivalence_fields)
         actions.extend(resolve_merge_conflicts(merge_conflicts))
     finally:
         serialize_actions(actions, filename)
-
-    msg("There are %d members that can be cleanly synced" % len(needs_sync))
-    msg("There are %d members that are fully synced" % len(up_to_date))
-    if verbose:
-        print_needs_sync(sorted(needs_sync), equivalence_fields,
-                         at_dict_some_fields, an_dict_some_fields)
-        print_merge_conflicts(sorted(unresolved_conflicts))
-
-    if verbose:
-        msg("#"*100)
-        msg("#"*100)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -412,7 +404,8 @@ if __name__ == "__main__":
     """ Each row here defines an equivalence, meaning, a user with the
         same first AND last name, OR the same email, are considered to be the
         same user. Add rows to add additional equivalences."""
-    all_equivalence_fields = [['last_name', 'first_name'],
+    all_equivalence_fields = [
+                             #['last_name', 'first_name'],
                               ['email_address']]
     for equivalence_fields in all_equivalence_fields:
         get_merge_info(an_members, at_members, equivalence_fields, verbose)

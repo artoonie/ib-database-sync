@@ -16,17 +16,20 @@ class Member(object):
         self.last_edit = last_edit
         self.source_name = source_name
         self.dirty = False
+        self.original_dict = {} # what's dirty?
 
     def get(self, field):
         assert field in self.equality_fields
         return self.__dict__[field]
 
-    def set(self, field, value):
+    def set(self, field, new_value):
         assert field in self.equality_fields
 
-        if self.__dict__[field] != value:
+        curr_value = self.__dict__[field]
+        if curr_value != new_value:
             self.dirty = True
-            self.__dict__[field] = value
+            self.original_dict[field] = curr_value
+            self.__dict__[field] = new_value
 
     def prettystring(self):
         return "%30s %60s - %10s" % \
