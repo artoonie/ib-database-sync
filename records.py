@@ -16,7 +16,7 @@ class Member(object):
         self.last_edit = last_edit
         self.source_name = source_name
         self.dirty = False
-        self.original_dict = {} # what's dirty?
+        self._original_dict = {} # what's dirty?
 
     def get(self, field):
         assert field in self.equality_fields
@@ -28,7 +28,7 @@ class Member(object):
         curr_value = self.__dict__[field]
         if curr_value != new_value:
             self.dirty = True
-            self.original_dict[field] = curr_value
+            self._original_dict[field] = curr_value
             self.__dict__[field] = new_value
 
     def prettystring(self):
@@ -36,6 +36,9 @@ class Member(object):
                 (unicode(self.first_name) + " " + unicode(self.last_name),
                  "<"+unicode(self.email_address)+">",
                  self.zip_code)
+
+    def dirty_fields(self):
+        return self._original_dict.keys()
 
 class HashFriendlyMember(Member):
     """ This class is sortable and hashable based on equality_fields.

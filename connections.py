@@ -7,36 +7,57 @@ import os
 import requests
 import time
 import timeago
-
 import hashlib
 import json
+
 from records import HashFriendlyMember
+from actions import CreateAction, UpdateAction, DeleteAction
 
 class Connection(object):
     def __init__(self, verbose):
         self.verbose = verbose
 
-    def request(self, href, params, headers):
+    def _request_helper(self, href, params, headers, action=requests.get, data=None):
+        kwargs = {'params': params, 'headers': headers}
+        if data is not None:
+            kwargs['data'] = json.dumps(data)
+            kwargs['headers']['Content-Type'] = 'application/json'
+
         try_count = 0
         while try_count < 3:
             try:
-                response = requests.get(href,
-                                        params = params,
-                                        headers = headers)
-                return response.json()
-            except Exception as e:
-                try_count += 1
-        raise RuntimeError("Tried thrice and failed to get url " + href +\
-                           "because of " + e.message)
+                response = action(href, **kwargs)
 
-    def make_request(self, href, params, header, cache_filename=None):
+                if response.status_code != 200:
+                    raise RuntimeError("Server error %d: %s" % 
+                          (response.status_code, response.text))
+
+                return response.json()
+            except requests.exceptions.RequestException as e:
+                try_count += 1
+        raise RuntimeError("Server errored thrice for URL %s:\n>> %s" %
+                           (href, e.message))
+
+    def post_request(self, href, params, headers, data):
+        return self._request_helper(href, params, headers, requests.post, data)
+
+    def put_request(self, href, params, headers, data):
+        return self._request_helper(href, params, headers, requests.put, data)
+
+    def get_request(self, href, params, headers):
+        return self._request_helper(href, params, headers, requests.get)
+
+    def delete_request(self, href, params, headers):
+        return self._request_helper(href, params, headers, requests.delete)
+
+    def make_request(self, href, params, headers, cache_filename=None):
         """ set cache_filename to enable caching of this result """
         if cache_filename is None or not os.path.exists(cache_filename):
             if self.verbose:
                 print("Requesting " + href)
-            json_response = self.request(href,
-                                         params = params,
-                                         headers = header)
+            json_response = self.get_request(href,
+                                            params = params,
+                                            headers = headers)
             time.sleep(0.2) # Respect AirTable rate limiting rules
             if cache_filename:
                 cache_directory = os.path.dirname(cache_filename)
@@ -56,15 +77,29 @@ class Connection(object):
 
         return json_response
 
+    # Each connection must know how to do any action
+    def do_action(self, action):
+        if isinstance(action, CreateAction):
+            self._do_action_create(action)
+        elif isinstance(action, UpdateAction):
+            self._do_action_update(action)
+        elif isinstance(action, DeleteAction):
+            self._do_action_delete(action)
+        else: assert False
+
+    def _do_action_create(self, action): assert False
+    def _do_action_update(self, action): assert False
+    def _do_action_update(self, action): assert False
+
 class ANConnection(Connection):
     def __init__(self, an_token, verbose):
         super(ANConnection, self).__init__(verbose)
-        self.header = {'OSDI-API-Token': an_token}
-        self.params = None
+        self.headers = {'OSDI-API-Token': an_token}
+        self.params = {}
         self.href = 'https://actionnetwork.org/api/v2/people'
         self.num_members_filtered = 0
 
-    def _create_member_from(self, member_json):
+    def _json_to_member(self, member_json):
         address = member_json['postal_addresses'][0]
         return HashFriendlyMember(
             email_address = member_json['email_addresses'][0]['address'],
@@ -74,6 +109,17 @@ class ANConnection(Connection):
             zip_code      = address.get('postal_code'),
             unique_id     = member_json['identifiers'][0],
             source_name   = "ActionNetwork")
+
+    def _member_to_json(self, member):
+        return {
+                  "person" : {
+                    "family_name" : member.last_name,
+                    "given_name" : member.first_name,
+                    "postal_addresses" : [ { "postal_code" : member.zip_code }],
+                    "email_addresses" : [ { "address" : member.email_address }]
+                  }
+                }
+
 
     def _filter_unimportant(self, members_json):
         # Far away members who signed up to watch the Lakoff/Hochchild stream
@@ -114,7 +160,7 @@ class ANConnection(Connection):
             forms_json = self.make_request(
                 href = forms_href,
                 params = self.params,
-                header = self.header,
+                headers = self.headers,
                 cache_filename = 'cache/an-submissions/' + cache_filename)
             submissions =  forms_json['_embedded']['osdi:submissions']
 
@@ -128,7 +174,7 @@ class ANConnection(Connection):
             form_json = self.make_request(
                 href = form_href,
                 params = self.params,
-                header = self.header,
+                headers = self.headers,
                 cache_filename = 'cache/an-forms/' + cache_filename)
 
             try:
@@ -163,7 +209,7 @@ class ANConnection(Connection):
     def _create_members_from(self, an_json):
         members_json = an_json['_embedded']['osdi:people']
         members_json = self._filter_unimportant(members_json)
-        return [self._create_member_from(x) for x in members_json]
+        return [self._json_to_member(x) for x in members_json]
 
     def create_members(self):
         members = []
@@ -173,7 +219,7 @@ class ANConnection(Connection):
             an_json = self.make_request(
                 href = href,
                 params = self.params,
-                header = self.header,
+                headers = self.headers,
                 cache_filename = 'cache/an_cache_%s.json' % page)
             members.extend(self._create_members_from(an_json))
 
@@ -185,6 +231,40 @@ class ANConnection(Connection):
             page += 1
             assert page < 500 # safety check
 
+    def _do_action_create(self, action):
+        formatted_member = self._member_to_json(action.member)
+        self.post_request(href = self.href,
+                          params = self.params,
+                          headers = self.headers,
+                          data = formatted_member)
+
+    def _do_action_update(self, action): pass
+
+    def _do_action_delete(self, action):
+        # Note: deletion is not allowed, so we update instead
+        # https://actionnetwork.org/docs/v2/people#delete
+        params = dict(self.params)
+        params['filter'] = "email_address eq '%s'" % action.member.email_address
+
+        json_data = self.get_request(href = self.href,
+                                     params = params,
+                                     headers = self.headers)
+        people = json_data['_links']['osdi:people']
+        assert len(people) == 1
+        href = people[0]['href']
+        data = {
+          "email_addresses": [
+            {
+              "status": "unsubscribed"
+            }
+          ]
+        }
+        self.put_request(href = href,
+                         params = self.params,
+                         headers = self.headers,
+                         data = data)
+
+
 class ATConnection(Connection):
     fields_to_request = ('Email Address',
                          'First Name',
@@ -194,12 +274,12 @@ class ATConnection(Connection):
 
     def __init__(self, at_token, verbose):
         super(ATConnection, self).__init__(verbose)
-        self.header = {'Authorization': 'Bearer %s' % at_token}
+        self.headers = {'Authorization': 'Bearer %s' % at_token}
         self.params = {'fields': self.fields_to_request}
         self.href = 'https://api.airtable.com/v0/appKBM2llidtAm4kw/'\
                     'Community%20Members'
 
-    def _create_member_from(self, member_json):
+    def _json_to_member(self, member_json):
         # TODO: Can we get the modified time instead of created?
         fields = member_json['fields']
         last_edit = fields.get('createdTime', None)
@@ -216,7 +296,7 @@ class ATConnection(Connection):
 
     def _create_members_from(self, at_json):
         members_json = at_json['records']
-        return [self._create_member_from(x) for x in members_json]
+        return [self._json_to_member(x) for x in members_json]
 
     def create_members(self):
         members = []
@@ -226,7 +306,7 @@ class ATConnection(Connection):
             at_json = self.make_request(
                               href = self.href,
                               params = params,
-                              header = self.header,
+                              headers = self.headers,
                               cache_filename = 'cache/at_cache_%s.json' % page)
             members.extend(self._create_members_from(at_json))
 

@@ -9,6 +9,7 @@ import os
 import shutil
 from tqdm import tqdm
 
+from actions import CreateAction, UpdateAction, DeleteAction
 from connections import ANConnection, ATConnection
 from records import Member
 
@@ -119,6 +120,11 @@ class MissingFieldResolver(ConflictResolver):
             assert len(not_none) == 1
             real_value = not_none[0]
 
+            if real_value == "":
+                # Empty string is not useful - cannot resolve simply
+                all_conflicts_resolved = False
+                continue
+
             for member in members:
                 member.set(field, real_value)
         if all_conflicts_resolved:
@@ -183,34 +189,6 @@ class ManualResolver(ConflictResolver):
             assert(isinstance(option, Member))
             self.set_every_field_to(equality_fields, members, option)
             return True
-
-class Action(object):
-    def __init__(self, member):
-        self.member = member
-
-    def serialize(self):
-        d = {'id': self.member.unique_id,
-             'action': self.action_name()}
-        d.update(self.additional_fields())
-        return d
-
-    def additional_fields(self):
-        return {}
-
-class CreateAction(Action):
-    def action_name(self):
-        return "create"
-
-class DeleteAction(Action):
-    def action_name(self):
-        return "delete"
-
-class UpdateAction(Action):
-    def action_name(self):
-        return "update"
-
-    def additional_fields(self):
-        return self.member.original_dict
 
 def hash_members(members, equivalence_fields):
     d = {}
