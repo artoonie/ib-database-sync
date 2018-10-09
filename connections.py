@@ -44,6 +44,9 @@ class Connection(object):
     def put_request(self, href, params, headers, data):
         return self._request_helper(href, params, headers, requests.put, data)
 
+    def patch_request(self, href, params, headers, data):
+        return self._request_helper(href, params, headers, requests.patch, data)
+
     def get_request(self, href, params, headers):
         return self._request_helper(href, params, headers, requests.get)
 
@@ -79,12 +82,14 @@ class Connection(object):
 
     # Each connection must know how to do any action
     def do_action(self, action):
+        """ Create actions return the Member that was created.
+            Other actions return nothing. """
         if isinstance(action, CreateAction):
-            self._do_action_create(action)
+            return self._do_action_create(action)
         elif isinstance(action, UpdateAction):
-            self._do_action_update(action)
+            return self._do_action_update(action)
         elif isinstance(action, DeleteAction):
-            self._do_action_delete(action)
+            return self._do_action_delete(action)
         else: assert False
 
     def _do_action_create(self, action): assert False
@@ -111,15 +116,23 @@ class ANConnection(Connection):
             source_name   = "ActionNetwork")
 
     def _member_to_json(self, member):
-        return {
-                  "person" : {
-                    "family_name" : member.last_name,
-                    "given_name" : member.first_name,
-                    "postal_addresses" : [ { "postal_code" : member.zip_code }],
-                    "email_addresses" : [ { "address" : member.email_address }]
-                  }
-                }
+        """ Allows you to pass in a Member or a dictionary, and
+            only returns JSON fields for non-null fields, which
+            allows for creation of partial dictionaries for updates """
+        p = {}
+        if member.get('last_name') is not None:
+            p['family_name'] = member.get('last_name')
 
+        if member.get('first_name') is not None:
+            p['given_name'] = member.get('first_name')
+
+        if member.get('zip_code') is not None:
+            p['postal_addresses'] = [{'postal_code': member.get('zip_code')}]
+
+        if member.get('email_address') is not None:
+            p['email_addresses'] = [{'address': member.get('email_address')}]
+
+        return {'person': p}
 
     def _filter_unimportant(self, members_json):
         # Far away members who signed up to watch the Lakoff/Hochchild stream
@@ -233,25 +246,32 @@ class ANConnection(Connection):
 
     def _do_action_create(self, action):
         formatted_member = self._member_to_json(action.member)
-        self.post_request(href = self.href,
-                          params = self.params,
-                          headers = self.headers,
-                          data = formatted_member)
+        data = self.post_request(href = self.href,
+                                 params = self.params,
+                                 headers = self.headers,
+                                 data = formatted_member)
+        return self._json_to_member(data)
 
-    def _do_action_update(self, action): pass
+    def _do_action_update_helper(self, action, data):
+        # Construct URL as per
+        # https://actionnetwork.org/docs/v1/queries
+        prefix = 'action_network:'
+        assert prefix in action.member.unique_id
+        unique_id = action.member.unique_id[len(prefix):]
+        href = self.href + "/" + unique_id
+
+        self.put_request(href = href,
+                         params = self.params,
+                         headers = self.headers,
+                         data = data)
+
+    def _do_action_update(self, action):
+        data = self._member_to_json(action.member)
+        self._do_action_update_helper(action, data)
 
     def _do_action_delete(self, action):
         # Note: deletion is not allowed, so we update instead
         # https://actionnetwork.org/docs/v2/people#delete
-        params = dict(self.params)
-        params['filter'] = "email_address eq '%s'" % action.member.email_address
-
-        json_data = self.get_request(href = self.href,
-                                     params = params,
-                                     headers = self.headers)
-        people = json_data['_links']['osdi:people']
-        assert len(people) == 1
-        href = people[0]['href']
         data = {
           "email_addresses": [
             {
@@ -259,10 +279,7 @@ class ANConnection(Connection):
             }
           ]
         }
-        self.put_request(href = href,
-                         params = self.params,
-                         headers = self.headers,
-                         data = data)
+        self._do_action_update_helper(action, data)
 
 
 class ATConnection(Connection):
@@ -293,6 +310,18 @@ class ATConnection(Connection):
             unique_id     = member_json["id"],
             source_name   = "AirTable")
 
+    def _member_to_json(self, member):
+        """ Allows you to pass in a Member or a dictionary, and
+            only returns JSON fields for non-null fields, which
+            allows for creation of partial dictionaries for updates """
+        p = {}
+
+        conversion = ['email_address', 'first_name', 'last_name', 'zip_code']
+        for (ours, theirs) in zip(conversion, self.fields_to_request):
+            if member.get(ours) is not None:
+                p[theirs] = member.get(ours)
+
+        return {'fields': p}
 
     def _create_members_from(self, at_json):
         members_json = at_json['records']
@@ -316,3 +345,28 @@ class ATConnection(Connection):
             params['offset'] = at_json['offset']
             page += 1
             assert page < 500 # safety check
+
+    def _href_for_member(self, member):
+        return self.href + '/' + member.unique_id
+
+    def _do_action_create(self, action):
+        formatted_member = self._member_to_json(action.member)
+        data = self.post_request(href = self.href,
+                                 params = self.params,
+                                 headers = self.headers,
+                                 data = formatted_member)
+        return self._json_to_member(data)
+
+    def _do_action_update(self, action):
+        formatted_member = self._member_to_json(action.member)
+        href = self._href_for_member(action.member)
+        data = self.patch_request(href = href,
+                                  params = self.params,
+                                  headers = self.headers,
+                                  data = formatted_member)
+
+    def _do_action_delete(self, action):
+        href = self._href_for_member(action.member)
+        data = self.delete_request(href = href,
+                                   params = self.params,
+                                   headers = self.headers)

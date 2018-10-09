@@ -6,12 +6,13 @@ along with helpers to make it hashable based on a subset of the fields
 class Member(object):
     def __init__(self, first_name, last_name, email_address,
                  zip_code, last_edit, source_name, unique_id):
+        # Member data
         self.first_name     = first_name
         self.last_name      = last_name
         self.email_address  = email_address
         self.zip_code       = zip_code
 
-        # Everything below this line will not be a part of the equality fields
+        # Metadata
         self.unique_id = unique_id
         self.last_edit = last_edit
         self.source_name = source_name
@@ -19,12 +20,9 @@ class Member(object):
         self._original_dict = {} # what's dirty?
 
     def get(self, field):
-        assert field in self.equality_fields
         return self.__dict__[field]
 
     def set(self, field, new_value):
-        assert field in self.equality_fields
-
         curr_value = self.__dict__[field]
         if curr_value != new_value:
             self.dirty = True
