@@ -5,6 +5,7 @@ class Action(object):
     def serialize(self):
         d = {'id': self.member.unique_id,
              'source': self.member.source_name,
+             'member': self.member.prettystring(),
              'action': self.action_name()}
         d.update(self.additional_fields())
         return d

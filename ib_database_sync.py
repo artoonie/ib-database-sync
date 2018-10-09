@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 from tqdm import tqdm
+import pickle
 
 from actions import CreateAction, UpdateAction, DeleteAction
 from connections import ANConnection, ATConnection
@@ -299,6 +300,25 @@ def resolve_merge_conflicts(merge_conflicts):
             break
     return actions
 
+def sync_actions(needs_sync):
+    actions = []
+    for member in needs_sync:
+        if member.source_name is "AirTable":
+            source = "ActionNetwork"
+        elif member.source_name is "ActionNetwork":
+            source = "AirTable"
+        else: assert False
+
+        new_member = Member(first_name = member.first_name,
+                            last_name = member.last_name,
+                            email_address = member.email_address,
+                            zip_code = member.zip_code,
+                            last_edit = 0,
+                            source_name = source,
+                            unique_id = None)
+        actions.append(CreateAction(new_member))
+    return actions
+
 def print_needs_sync(needs_sync, equivalence_fields,
                      at_dict_some_fields, an_dict_some_fields):
     for member in needs_sync:
@@ -310,17 +330,27 @@ def print_needs_sync(needs_sync, equivalence_fields,
         else:
             assert False
 
-def serialize_actions(actions, filename):
-    d = [action.serialize() for action in actions]
+def serialize_actions(actions, basename):
+    def make_unique(filename):
+        if os.path.exists(filename):
+            i = 0
+            backup_filename_fmt = filename + "_%d"
+            while os.path.exists(backup_filename_fmt % i):
+                i += 1
+            shutil.copy2(filename, backup_filename_fmt % i)
+        return filename
 
-    if os.path.exists(filename):
-        i = 0
-        backup_filename_fmt = filename + "_%d"
-        while os.path.exists(backup_filename_fmt % i):
-            i += 1
-        shutil.copy2(filename, backup_filename_fmt % i)
-    with open(filename, 'w') as f:
+    # Simple serialization
+    json_filename = basename + ".json"
+    make_unique(json_filename)
+    d = [action.serialize() for action in actions]
+    with open(json_filename, 'w') as f:
         json.dump(d, f, indent=4)
+
+    pickle_filename = basename + ".pickle"
+    make_unique(pickle_filename)
+    with open(pickle_filename, 'w') as f:
+        pickle.dump(actions, f)
 
 def get_merge_info(an_members, at_members, equivalence_fields, verbose):
     an_dups = find_duplicates(an_members, equivalence_fields)
@@ -334,7 +364,7 @@ def get_merge_info(an_members, at_members, equivalence_fields, verbose):
     msg()
 
     actions = []
-    filename = "actions.json"
+    filename = "serialized"
     try:
         actions.extend(resolve_duplicates(an_dups))
         actions.extend(resolve_duplicates(at_dups))
@@ -344,6 +374,7 @@ def get_merge_info(an_members, at_members, equivalence_fields, verbose):
         at_members_clean = [m for m in at_members if not m.dirty]
         merge_conflicts, needs_sync, up_to_date = find_duplicates_across(
                     an_members_clean, at_members_clean, equivalence_fields)
+        actions.extend(sync_actions(needs_sync))
         actions.extend(resolve_merge_conflicts(merge_conflicts))
     finally:
         serialize_actions(actions, filename)

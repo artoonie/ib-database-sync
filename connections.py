@@ -294,7 +294,7 @@ class ATConnection(Connection):
         self.headers = {'Authorization': 'Bearer %s' % at_token}
         self.params = {'fields': self.fields_to_request}
         self.href = 'https://api.airtable.com/v0/appKBM2llidtAm4kw/'\
-                    'Community%20Members'
+                    'Community%20Members%20Staging'
 
     def _json_to_member(self, member_json):
         # TODO: Can we get the modified time instead of created?
