@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from connections import ANConnection, ATConnection
 from actions import CreateAction, DeleteAction, UpdateAction
 from records import Member
+from ib_database_sync import ZipCodeResolver
 
 @contextmanager
 def assert_raises(exception_type):
@@ -28,10 +29,43 @@ def test_connections():
     _test_connection_with(at_connection)
     _test_connection_with(an_connection)
 
-def _test_connection_with(connection):
-    # Note: unique_ids start with action_network because that's what's
-    # required by AN and AT is agnostic
-    test_member = Member(
+def test_zip_resolver():
+    resolver = ZipCodeResolver()
+
+    member0 = _get_fake_member()
+    member1 = _get_fake_member()
+    member0.zip_code = "12345"
+    member1.zip_code = "12345-6789"
+    member0._dirty = False
+    member1._dirty = False
+    equality_fields = ['first_name', 'last_name', 'email_address', 'zip_code']
+
+    member1.first_name = "different name"
+    member1._dirty = False
+    assert not resolver.resolve([member0, member1], equality_fields)
+    assert not member0.dirty
+    assert not member1.dirty
+    member1.first_name = member0.first_name
+    member1._dirty = False
+
+    assert resolver.resolve([member0, member1], equality_fields)
+    assert member0.zip_code == "12345-6789"
+    assert member1.zip_code == "12345-6789"
+
+    member0.zip_code = "an_email@gmail.com"
+    member0._dirty = False
+    assert resolver.resolve([member0, member1], equality_fields)
+    assert member0.dirty
+    assert not member1.dirty
+
+    member0.zip_code = "00000-0000"
+    assert resolver.resolve([member0, member1], equality_fields)
+
+    member0.zip_code = None
+    assert resolver.resolve([member0, member1], equality_fields)
+
+def _get_fake_member():
+    return Member(
             email_address = "nonexistent@gmail.com",
             last_edit     = 0,
             first_name    = "Armin's",
@@ -40,6 +74,10 @@ def _test_connection_with(connection):
             unique_id     = "action_network:N/A",
             source_name   = "AirTable")
 
+def _test_connection_with(connection):
+    # Note: unique_ids start with action_network because that's what's
+    # required by AN and AT is agnostic
+    test_member = _get_fake_member()
     action = CreateAction(test_member)
     new_member = connection.do_action(action)
 

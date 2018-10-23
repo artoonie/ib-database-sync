@@ -6,6 +6,7 @@ and ActionNetwork databases.
 import argparse
 import json
 import os
+import re
 import shutil
 from tqdm import tqdm
 import pickle
@@ -134,6 +135,39 @@ class MissingFieldResolver(ConflictResolver):
             msg()
         return all_conflicts_resolved
 
+class ZipCodeResolver(ConflictResolver):
+    """ Resolves any zip code differences by picking the most precise zip
+        available (12345-6789 format first, 12345 second).
+        If there are multiple zips, chooses one randomly."""
+    def __init__(self):
+        self.precise_zip = re.compile(r'^\d{5}\-\d{4}$')
+        self.any_zip = re.compile(r'^\d{5}$')
+
+    def resolve(self, members, equality_fields):
+        if 'zip_code' not in equality_fields:
+            return False
+
+        for field in equality_fields:
+            if field=='zip_code': continue
+            if self.is_any_conflict(members, field):
+                return False
+
+        zips = [member.zip_code for member in members]
+        zips = ["" if z is None else z for z in zips]
+        is_precise_zip = [z is not None and self.precise_zip.match(z) is not None for z in zips]
+        is_okay_zip    = [z is not None and self.any_zip.match(z)     is not None for z in zips]
+        if(any(is_precise_zip)):
+            chosen_zip = zips[is_precise_zip.index(True)]
+        elif(any(is_okay_zip)):
+            chosen_zip = zips[is_okay_zip.index(True)]
+        else:
+            return False
+
+        for m in members:
+            m.zip_code = chosen_zip
+
+        return True
+
 class UserQuit(Exception): pass
 class ManualResolver(ConflictResolver):
     def prompt_field(self, members, field):
@@ -235,10 +269,10 @@ def find_duplicates_across(an_members,  at_members, equivalence_fields):
     an_dict_all_fields  = hash_members(an_members, None)
     at_dict_all_fields  = hash_members(at_members, None)
 
-    # Collisions in some_fields means that the two members share equivalence_fields
+    # Collisions in equality_fields means that the two members share equivalence_fields
     # but may (or may not) share other data.
-    an_dict_some_fields = hash_members(an_members, equivalence_fields)
-    at_dict_some_fields = hash_members(at_members, equivalence_fields)
+    an_dict_equality_fields = hash_members(an_members, equivalence_fields)
+    at_dict_equality_fields = hash_members(at_members, equivalence_fields)
 
     # all_members contains ??
     all_members_keys = set(an_dict_all_fields.keys()+at_dict_all_fields.keys())
@@ -254,28 +288,35 @@ def find_duplicates_across(an_members,  at_members, equivalence_fields):
     needs_sync = []
     up_to_date = []
 
-    resolvers = [MissingFieldResolver(), ManualResolver()]
+    resolvers = [MissingFieldResolver(), ZipCodeResolver(), ManualResolver()]
 
+    keys_already_processed = set()
     for member in all_members:
         key_in_all = member.hash_with(None)
-        key_in_some = member.hash_with(equivalence_fields)
+        equality_key = member.hash_with(equivalence_fields)
+
+        # Each merge conflict will be several times, once by each member
+        # in the conflict. Prevent that.
+        if equality_key in keys_already_processed:
+            continue
+        keys_already_processed.add(equality_key)
 
         is_in_at_all = key_in_all in at_dict_all_fields
         is_in_an_all = key_in_all in an_dict_all_fields
-        is_in_at_some = key_in_some in at_dict_some_fields
-        is_in_an_some = key_in_some in an_dict_some_fields
+        is_in_at_equality = equality_key in at_dict_equality_fields
+        is_in_an_equality = equality_key in an_dict_equality_fields
         assert is_in_at_all or is_in_an_all
-        assert is_in_at_some or is_in_an_some
+        assert is_in_at_equality or is_in_an_equality
 
         if not is_in_at_all or not is_in_an_all:
-            if is_in_at_some and is_in_an_some:
-                members_conflicted = an_dict_some_fields[key_in_some] +\
-                                     at_dict_some_fields[key_in_some]
+            if is_in_at_equality and is_in_an_equality:
+                members_conflicted = an_dict_equality_fields[equality_key] +\
+                                     at_dict_equality_fields[equality_key]
                 conflict = MergeConflict(members_conflicted, resolvers)
                 merge_conflicts.append(conflict)
-            elif is_in_at_some and not is_in_an_some:
+            elif is_in_at_equality and not is_in_an_equality:
                 needs_sync.append(member)
-            elif is_in_an_some and not is_in_at_some:
+            elif is_in_an_equality and not is_in_at_equality:
                 needs_sync.append(member)
             else:
                 assert False
@@ -320,12 +361,12 @@ def sync_actions(needs_sync):
     return actions
 
 def print_needs_sync(needs_sync, equivalence_fields,
-                     at_dict_some_fields, an_dict_some_fields):
+                     at_dict_equality_fields, an_dict_equality_fields):
     for member in needs_sync:
         key = member.hash_with(equivalence_fields)
-        if key not in at_dict_some_fields:
+        if key not in at_dict_equality_fields:
             msg("     Airtable is missing member", member.prettystring())
-        elif key not in an_dict_some_fields:
+        elif key not in an_dict_equality_fields:
             msg("ActionNetwork is missing member", member.prettystring())
         else:
             assert False
@@ -374,8 +415,22 @@ def get_merge_info(an_members, at_members, equivalence_fields, verbose):
         at_members_clean = [m for m in at_members if not m.dirty]
         merge_conflicts, needs_sync, up_to_date = find_duplicates_across(
                     an_members_clean, at_members_clean, equivalence_fields)
-        actions.extend(sync_actions(needs_sync))
-        actions.extend(resolve_merge_conflicts(merge_conflicts))
+
+        sync_actions_ = sync_actions(needs_sync)
+        actions.extend(sync_actions_)
+
+        merge_actions = resolve_merge_conflicts(merge_conflicts)
+        actions.extend(merge_actions)
+
+        # Print out summary
+        def is_from(m, where): return m.source_name == where
+        sync_count_at = sum([is_from(m, "AirTable") for m in needs_sync])
+        sync_count_an = sum([is_from(m, "ActionNetwork") for m in needs_sync])
+        msg("%d members created via sync, of which\n"
+            "   %d originated from AirTable, and\n"
+            "   %d originated from ActionNetwork" % \
+                (len(sync_actions_), sync_count_at, sync_count_an))
+        msg("%d/%d merge conflicts were resolved" % (len(merge_actions), len(merge_conflicts)))
     finally:
         serialize_actions(actions, filename)
 
