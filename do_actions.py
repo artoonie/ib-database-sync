@@ -8,16 +8,14 @@ def do_actions(actions, an_connection, at_connection):
         print "Doing action:"
         print "   ", action.serialize()
 
-        if action.member.source_name == "AirTable":
-            at_connection.do_action(action)
-        else:
-            # During testing: have not yet set up a staging environment
-            # for actionnetwork, so don't commit to the real data
-            continue
-
-        # elif action.member.source_name == "ActionNetwork":
-        #     an_connection.do_action(action)
-        # else: assert False
+        try:
+            if action.member.source_name == "AirTable":
+                at_connection.do_action(action)
+            elif action.member.source_name == "ActionNetwork":
+                an_connection.do_action(action)
+            else: assert False
+        except RuntimeError as e:
+            print("Warning: runtime error", e)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

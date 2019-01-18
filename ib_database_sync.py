@@ -264,7 +264,7 @@ def print_duplicates_within(dups):
             msg(member.prettystring())
         msg()
 
-def find_duplicates_across(an_members,  at_members, equivalence_fields):
+def find_duplicates_across(an_members, at_members, an_tossed, equivalence_fields):
     # Collisions in all_fields means that the two members are exact copies
     an_dict_all_fields  = hash_members(an_members, None)
     at_dict_all_fields  = hash_members(at_members, None)
@@ -273,6 +273,7 @@ def find_duplicates_across(an_members,  at_members, equivalence_fields):
     # but may (or may not) share other data.
     an_dict_equality_fields = hash_members(an_members, equivalence_fields)
     at_dict_equality_fields = hash_members(at_members, equivalence_fields)
+    an_tossed_equality_fields = hash_members(an_tossed, equivalence_fields)
 
     # all_members contains ??
     all_members_keys = set(an_dict_all_fields.keys()+at_dict_all_fields.keys())
@@ -305,6 +306,7 @@ def find_duplicates_across(an_members,  at_members, equivalence_fields):
         is_in_an_all = key_in_all in an_dict_all_fields
         is_in_at_equality = equality_key in at_dict_equality_fields
         is_in_an_equality = equality_key in an_dict_equality_fields
+        is_in_an_tossed = equality_key in an_tossed_equality_fields
         assert is_in_at_all or is_in_an_all
         assert is_in_at_equality or is_in_an_equality
 
@@ -315,7 +317,8 @@ def find_duplicates_across(an_members,  at_members, equivalence_fields):
                 conflict = MergeConflict(members_conflicted, resolvers)
                 merge_conflicts.append(conflict)
             elif is_in_at_equality and not is_in_an_equality:
-                needs_sync.append(member)
+                if not is_in_an_tossed:
+                    needs_sync.append(member)
             elif is_in_an_equality and not is_in_at_equality:
                 needs_sync.append(member)
             else:
@@ -393,7 +396,7 @@ def serialize_actions(actions, basename):
     with open(pickle_filename, 'w') as f:
         pickle.dump(actions, f)
 
-def get_merge_info(an_members, at_members, equivalence_fields, verbose):
+def get_merge_info(an_members, at_members, an_tossed, equivalence_fields, verbose):
     an_dups = find_duplicates(an_members, equivalence_fields)
     at_dups = find_duplicates(at_members, equivalence_fields)
 
@@ -414,7 +417,7 @@ def get_merge_info(an_members, at_members, equivalence_fields, verbose):
         an_members_clean = [m for m in an_members if not m.dirty]
         at_members_clean = [m for m in at_members if not m.dirty]
         merge_conflicts, needs_sync, up_to_date = find_duplicates_across(
-                    an_members_clean, at_members_clean, equivalence_fields)
+                    an_members_clean, at_members_clean, an_tossed, equivalence_fields)
 
         sync_actions_ = sync_actions(needs_sync)
         actions.extend(sync_actions_)
@@ -461,15 +464,13 @@ if __name__ == "__main__":
     msg("Found %d members on ActionNetwork and %d members on AirTable" % \
             (len(an_members), len(at_members)))
 
+    numFiltered = len(an_connection.tossed_members)
     msg("We filtered out %d/%d members from ActionNetwork." % \
-            (an_connection.num_members_filtered,
-             len(an_members)+an_connection.num_members_filtered))
+            (numFiltered, len(an_members)+numFiltered))
 
-    """ Each row here defines an equivalence, meaning, a user with the
-        same first AND last name, OR the same email, are considered to be the
-        same user. Add rows to add additional equivalences."""
     all_equivalence_fields = [
                              #['last_name', 'first_name'],
                               ['email_address']]
     for equivalence_fields in all_equivalence_fields:
-        get_merge_info(an_members, at_members, equivalence_fields, verbose)
+        get_merge_info(an_members, at_members,
+                       an_connection.tossed_members, equivalence_fields, verbose)

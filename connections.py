@@ -29,8 +29,8 @@ class Connection(object):
                 response = action(href, **kwargs)
 
                 if response.status_code != 200:
-                    raise RuntimeError("Server error %d: %s" % 
-                          (response.status_code, response.text))
+                    raise RuntimeError("Server error %d: %s\n%s" % 
+                          (response.status_code, response.text, href))
 
                 return response.json()
             except requests.exceptions.RequestException as e:
@@ -102,7 +102,6 @@ class ANConnection(Connection):
         self.headers = {'OSDI-API-Token': an_token}
         self.params = {}
         self.href = 'https://actionnetwork.org/api/v2/people'
-        self.num_members_filtered = 0
 
     def _json_to_member(self, member_json):
         address = member_json['postal_addresses'][0]
@@ -132,100 +131,38 @@ class ANConnection(Connection):
         if member.get('email_address') is not None:
             p['email_addresses'] = [{'address': member.get('email_address')}]
 
-        return {'person': p}
+        return p
 
-    def _filter_unimportant(self, members_json):
-        # Far away members who signed up to watch the Lakoff/Hochchild stream
-        # are not important and should really be purged from the database.
-        # Until then, we need to filter them out explicitly.
-        naughty_url = 'https://actionnetwork.org/forms/'\
-                      'live-stream-of-reaching-out-to-trump-voters'
+    def _sieve_of_inimportance(self, members_json):
+        def has_livestream(member):
+            if 'livestream 4/17' in member['custom_fields']:
+                if member['custom_fields']['livestream 4/17'] == 'yes':
+                    return True
+            return False
+        def is_unsubscribed(member):
+            if member['email_addresses'][0]['status'] != 'subscribed':
+                return True
+            return False
 
-        def cache_filename_from_url(url):
-            splitter = 'actionnetwork.org/api/v2/'
-            cache_filename = url.split(splitter)[1]
-            return cache_filename.replace('/', '-')
-        def km_from_berkeley(lat, lon):
-            # https://stackoverflow.com/questions/19412462/
-            # getting-distance-between-two-points-based-on-latitude-longitude
-            R = 6373.0
-
-            lat1 = radians(abs(lat))
-            lon1 = radians(abs(lon))
-            lat2 = radians(abs(37.872483))
-            lon2 = radians(abs(-122.266359))
-
-            dlon = lon2 - lon1
-            dlat = lat2 - lat1
-
-            a = sin(dlat / 2)**2 + cos(lat1) * cos(lat2) * sin(dlon / 2)**2
-            c = 2 * atan2(sqrt(a), sqrt(1 - a))
-
-            distance = R * c
-            return distance
-
-        def did_only_fill_out_form(member):
-            forms_href = member['_links']['osdi:submissions']['href']
-            cache_filename = cache_filename_from_url(forms_href)
-            assert isinstance(cache_filename, basestring)
-
-            # 1. Download the "submissions" list
-            forms_json = self.make_request(
-                href = forms_href,
-                params = self.params,
-                headers = self.headers,
-                cache_filename = 'cache/an-submissions/' + cache_filename)
-            submissions =  forms_json['_embedded']['osdi:submissions']
-
-            if len(submissions) != 1:
-                return False
-
-            # 2. Download the "form" to see what's inside
-            submission = submissions[0]
-            form_href = submission['_links']['osdi:form']['href']
-            cache_filename = cache_filename_from_url(form_href)
-            form_json = self.make_request(
-                href = form_href,
-                params = self.params,
-                headers = self.headers,
-                cache_filename = 'cache/an-forms/' + cache_filename)
-
-            try:
-                return form_json['browser_url'] == naughty_url
-            except KeyError as e:
-                if self.verbose:
-                    print "While trying to download form", form_href
-                    print "We received an error:", e.message
-                    print "The data returned from the server is:"
-                    print form_json
-                return False
-
-        def is_far_away(member):
-            loc = member['postal_addresses'][0]['location']
-            lat = loc['latitude']
-            lon = loc['longitude']
-            if lat is None or lon is None:
-                # Err on the side of keeping a member whose address is unknown
-                return False
-            return km_from_berkeley(float(lat), float(lon)) > 50
-
-        filtered_members = [m for m in members_json if
-                       not is_far_away(m) or not did_only_fill_out_form(m)]
-        #for m in members_json:
-        #    if not is_far_away(m):
-        #        print "member is not far away"
-        #    if not did_only_fill_out_form(m):
-        #        print "member filled out more than just one"
-        self.num_members_filtered += len(members_json)-len(filtered_members)
-        return filtered_members
+        keep_members = []
+        toss_members = []
+        for m in members_json:
+            if not has_livestream(m) and not is_unsubscribed(m):
+                keep_members.append(m)
+            else:
+                toss_members.append(m)
+        return keep_members, toss_members
 
     def _create_members_from(self, an_json):
         members_json = an_json['_embedded']['osdi:people']
-        members_json = self._filter_unimportant(members_json)
-        return [self._json_to_member(x) for x in members_json]
+        keep_json, toss_json = self._sieve_of_inimportance(members_json)
+        keep_members = [self._json_to_member(x) for x in keep_json]
+        toss_members = [self._json_to_member(x) for x in toss_json]
+        return keep_members, toss_members
 
     def create_members(self):
-        members = []
+        keeps = []
+        tosses = []
         page = 0
         href = self.href
         while True:
@@ -234,11 +171,14 @@ class ANConnection(Connection):
                 params = self.params,
                 headers = self.headers,
                 cache_filename = 'cache/an_cache_%s.json' % page)
-            members.extend(self._create_members_from(an_json))
+            keep, toss = self._create_members_from(an_json)
+            keeps.extend(keep)
+            tosses.extend(toss)
 
             href = an_json
             if 'next' not in an_json['_links']:
-                return members
+                self.tossed_members = tosses
+                return keeps
 
             href = an_json['_links']['next']['href']
             page += 1
@@ -254,9 +194,11 @@ class ANConnection(Connection):
 
     def _do_action_update_helper(self, action, data):
         # Construct URL as per
-        # https://actionnetwork.org/docs/v1/queries
+        # https://actionnetwork.org/docs/v2/queries
         prefix = 'action_network:'
-        assert prefix in action.member.unique_id
+        if prefix not in action.member.unique_id:
+            print "Warning! This member has a funny prefix. Not deleting", action.member
+            return
         unique_id = action.member.unique_id[len(prefix):]
         href = self.href + "/" + unique_id
 
@@ -286,15 +228,14 @@ class ATConnection(Connection):
     fields_to_request = ('Email Address',
                          'First Name',
                          'Last Name',
-                         'Zip code',
-                         'id')
+                         'Zip code')
 
     def __init__(self, at_token, verbose):
         super(ATConnection, self).__init__(verbose)
         self.headers = {'Authorization': 'Bearer %s' % at_token}
         self.params = {'fields': self.fields_to_request}
         self.href = 'https://api.airtable.com/v0/appKBM2llidtAm4kw/'\
-                    'Community%20Members%20Staging'
+                    'Community%20Members'
 
     def _json_to_member(self, member_json):
         # TODO: Can we get the modified time instead of created?
